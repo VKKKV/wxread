@@ -20,6 +20,7 @@ jobs:
   deploy:
     runs-on: ubuntu-22.04
     environment: AutoRead  # 指定环境
+    timeout-minutes: 180
 
     steps:
 
@@ -39,7 +40,10 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install certifi==2024.8.30 charset-normalizer==3.4.0 idna==3.10 requests==2.32.3 urllib3==2.2.3
+        python -m pip install -r requirements.txt
+
+    - name: Run offline regression tests
+      run: python -m unittest discover -s tests -v
 
     - name: Run deployment script
       env:
@@ -51,6 +55,8 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         SERVERCHAN_SPT:  ${{ secrets.SERVERCHAN_SPT }}
         READ_NUM: ${{ vars.READ_NUM }}  # 使用 Repository Variables
+        http_proxy: ${{ secrets.http_proxy }}
+        https_proxy: ${{ secrets.https_proxy }}
 
       run: |
         python main.py

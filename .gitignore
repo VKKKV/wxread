@@ -10,3 +10,7 @@ logs/
 .env
 .env.local
 .env.*.local
+
+# Cookie state contains credentials
+state/
+.cookies.json

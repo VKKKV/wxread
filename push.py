@@ -1,7 +1,5 @@
-import json
 import logging
 import os
-import random
 import time
 
 import requests
@@ -18,108 +16,112 @@ logger = logging.getLogger(__name__)
 
 
 class PushNotification:
+    ATTEMPTS = 3
+    RETRY_DELAYS = (1, 2)
+
     def __init__(self):
         self.pushplus_url = "https://www.pushplus.plus/send"
         self.telegram_url = "https://api.telegram.org/bot{}/sendMessage"
         self.server_chan_url = "https://sctapi.ftqq.com/{}.send"
-        self.wxpusher_simple_url = "https://wxpusher.zjiecode.com/api/send/message/{}/{}"
+        self.wxpusher_simple_url = "https://wxpusher.zjiecode.com/api/send/message/simple-push"
         self.headers = {"Content-Type": "application/json"}
         self.proxies = {
             "http": os.getenv("http_proxy"),
             "https": os.getenv("https_proxy"),
         }
 
-    def push_pushplus(self, content, token, is_success):
-        attempts = 5
-        title = f"微信阅读-{'成功' if is_success else '失败'}"
-        for attempt in range(attempts):
+    @staticmethod
+    def _failure(provider, exc):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.error("%s 推送失败 (exception=%s, status=%s)", provider, type(exc).__name__, status)
+
+    @staticmethod
+    def _json(response):
+        try:
+            return response.json()
+        except (ValueError, TypeError):
+            return None
+
+    def _request_with_retries(self, provider, request, success):
+        for attempt in range(self.ATTEMPTS):
             try:
-                response = requests.post(
-                    self.pushplus_url,
-                    data=json.dumps({"token": token, "title": title,"content": content,}).encode("utf-8"),headers=self.headers,timeout=10,)
+                response = request()
                 response.raise_for_status()
-                logger.info("PushPlus 响应: %s", response.text)
-                return True
-            except requests.exceptions.RequestException as exc:
-                logger.error("PushPlus 推送失败: %s", exc)
-                if attempt < attempts - 1:
-                    sleep_time = random.randint(180, 360)
-                    logger.info("%d 秒后重试...", sleep_time)
-                    time.sleep(sleep_time)
+                if success(self._json(response)):
+                    return True
+                logger.error("%s 推送失败 (business response rejected)", provider)
+            except (requests.exceptions.RequestException, ValueError) as exc:
+                self._failure(provider, exc)
+            if attempt < self.ATTEMPTS - 1:
+                time.sleep(self.RETRY_DELAYS[attempt])
         return False
 
+    def push_pushplus(self, content, token, is_success):
+        if not token:
+            return False
+        title = f"微信阅读-{'成功' if is_success else '失败'}"
+        payload = {"token": token, "title": title, "content": content}
+        return self._request_with_retries(
+            "PushPlus",
+            lambda: requests.post(self.pushplus_url, json=payload, headers=self.headers, timeout=10),
+            lambda data: isinstance(data, dict) and type(data.get("code")) is int and data["code"] == 200,
+        )
+
     def push_telegram(self, content, bot_token, chat_id):
+        if not bot_token or not chat_id:
+            return False
         url = self.telegram_url.format(bot_token)
         payload = {"chat_id": chat_id, "text": content}
 
         try:
-            response = requests.post(url, json=payload, proxies=self.proxies, timeout=30)
-            logger.info("Telegram 响应: %s", response.text)
+            response = requests.post(url, json=payload, proxies=self.proxies, timeout=10)
             response.raise_for_status()
-            return True
-        except Exception as exc:
-            logger.error("Telegram 代理发送失败: %s", exc)
-            try:
-                response = requests.post(url, json=payload, timeout=30)
-                response.raise_for_status()
+            data = self._json(response)
+            if isinstance(data, dict) and data.get("ok") is True:
                 return True
-            except Exception as inner_exc:
-                logger.error("Telegram 发送失败: %s", inner_exc)
-                return False
+            logger.error("Telegram 推送失败 (business response rejected)")
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            self._failure("Telegram proxy", exc)
+
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            return self._request_with_retries(
+                "Telegram direct",
+                lambda: session.post(url, json=payload, timeout=10),
+                lambda data: isinstance(data, dict) and data.get("ok") is True,
+            )
+        finally:
+            session.close()
 
     def push_wxpusher(self, content, spt):
-        attempts = 5
-        url = self.wxpusher_simple_url.format(spt, content)
-
-        for attempt in range(attempts):
-            try:
-                response = requests.get(url, timeout=10)
-                response.raise_for_status()
-                logger.info("WxPusher 响应: %s", response.text)
-                return True
-            except requests.exceptions.RequestException as exc:
-                logger.error("WxPusher 推送失败: %s", exc)
-                if attempt < attempts - 1:
-                    sleep_time = random.randint(180, 360)
-                    logger.info("%d 秒后重试...", sleep_time)
-                    time.sleep(sleep_time)
-        return False
+        if not spt:
+            return False
+        payload = {"spt": spt, "content": content, "contentType": 1}
+        return self._request_with_retries(
+            "WxPusher",
+            lambda: requests.post(self.wxpusher_simple_url, json=payload, headers=self.headers, timeout=10),
+            lambda data: isinstance(data, dict) and type(data.get("code")) is int and data["code"] == 1000,
+        )
 
     def push_serverChan(self, content, spt, is_success):
-        attempts = 5
-        url = self.server_chan_url.format(spt)
-
+        if not spt:
+            return False
         title = f"微信阅读-{'成功' if is_success else '失败'}"
-
-        for attempt in range(attempts):
-            try:
-                response = requests.post(
-                    url,
-                    data=json.dumps({"title": title, "desp": content}).encode("utf-8"),
-                    headers=self.headers,
-                    timeout=10,
-                )
-                response.raise_for_status()
-                logger.info("ServerChan 响应: %s", response.text)
-                return True
-            except requests.exceptions.RequestException as exc:
-                logger.error("ServerChan 推送失败: %s", exc)
-                if attempt < attempts - 1:
-                    sleep_time = random.randint(180, 360)
-                    logger.info("%d 秒后重试...", sleep_time)
-                    time.sleep(sleep_time)
-        return False
+        payload = {"title": title, "desp": content}
+        return self._request_with_retries(
+            "ServerChan",
+            lambda: requests.post(self.server_chan_url.format(spt), json=payload, headers=self.headers, timeout=10),
+            lambda data: isinstance(data, dict) and type(data.get("code")) is int and data["code"] == 0,
+        )
 
 
-def push(content, method, is_success = True):
+def push(content, method, is_success=True):
     notifier = PushNotification()
-
     if method in (None, ""):
         logger.warning("未配置推送渠道，跳过推送。")
         return False
-
-    method = str(method).lower()
-
+    method = str(method).strip().lower()
     if method == "pushplus":
         return notifier.push_pushplus(content, PUSHPLUS_TOKEN, is_success)
     if method == "telegram":
@@ -128,6 +130,5 @@ def push(content, method, is_success = True):
         return notifier.push_wxpusher(content, WXPUSHER_SPT)
     if method == "serverchan":
         return notifier.push_serverChan(content, SERVERCHAN_SPT, is_success)
-
-    logger.warning("无效的通知渠道 '%s'，已跳过推送。支持：pushplus、telegram、wxpusher、serverchan", method)
+    logger.warning("无效的通知渠道，已跳过推送。支持：pushplus、wxpusher、telegram、serverchan")
     return False

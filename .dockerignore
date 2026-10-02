@@ -1,0 +1,11 @@
+.git
+.idea
+__pycache__
+**/__pycache__
+*.pyc
+.env
+.env.*
+state
+.cookies.json
+logs
+*.log

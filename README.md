@@ -6,9 +6,9 @@
 
 该脚本具备以下功能：
 
-- **阅读时长调节**：默认计入排行榜和挑战赛，时长可调节，默认为60分钟。
+- **阅读时长调节**：默认计入排行榜和挑战赛，时长可调节，默认 40 次、约 20 分钟（接口是否计时以微信读书实际结果为准）。
 - **定时运行推送**：可部署在GitHub Action/服务器上，支持每天定时运行并推送结果到微信。
-- **Cookie自动更新**：脚本能自动获取并更新Cookie，一次部署后面无需其它操作。
+- **Cookie 续期**：运行时尝试续期；服务器可将刷新后的 Cookie 保存到私有状态文件。续期不等于永久登录，登录失效后仍需重新抓包。
 - **轻量化设计**：本脚本实现了轻量化的编写，部署服务器/GIthub action后到点运行，无需额外硬件。
 
 ***
@@ -65,7 +65,7 @@
 ```yaml
 services:
   wxread:
-    image: ghcr.io/findmover/wxread:latest
+    image: ghcr.io/vkkkv/wxread:latest
     container_name: wxread
     restart: unless-stopped
 
@@ -84,6 +84,8 @@ services:
       
       # 定时任务时间（Cron 表达式）
       CRON_SCHEDULE: "0 1 * * *"
+      JOB_TIMEOUT_SECONDS: ""  # 空值自动计算单次任务预算
+      COOKIE_STATE_FILE: "/app/state/cookies.json"
       
       # 可选配置：推送方式 (pushplus/wxpusher/telegram/serverchan)
       PUSH_METHOD: ""
@@ -96,12 +98,19 @@ services:
       WXPUSHER_SPT: ""
       # ServerChan 推送配置
       SERVERCHAN_SPT: ""
+
+    volumes:
+      - ./state:/app/state
 ```
 
 **Cron 定时任务配置：**
 - `0 1 * * *` - 每天凌晨1点（默认）
 - `0 */6 * * *` - 每6小时
 - `30 8 * * *` - 每天早上8:30
+- `0 1 * * 0` / `0 1 * * 7` / `0 1 * * sun` - 每周日凌晨1点
+
+使用标准五字段 Cron（分、时、日、月、星期），支持列表、范围与步长。日和星期均受限时采用 OR；不支持 `@daily`、`L`、`W` 等扩展。
+`JOB_TIMEOUT_SECONDS` 必须为正整数；留空时按 `max(3600, READ_NUM * 90 + 900)` 自动计算，超时会终止本次子进程，避免后续定时任务长期被占用。
 
 **步骤2：** 启动容器
 
@@ -120,23 +129,40 @@ docker-compose exec wxread python /app/main.py
 ```
 
 **Docker 说明：**
-- 镜像地址：`ghcr.io/findmover/wxread:latest`
+- 镜像地址：`ghcr.io/vkkkv/wxread:latest`
 - 支持多架构：linux/amd64 和 linux/arm64
 - 推送代码到仓库会自动构建最新镜像
 
 ***
 ## Attention 📢
 
-1. **签到次数调整**：只需签到完成挑战赛可以将`num`次数从120调整为2，每次`num`为30秒，200即100分钟。
+1. **签到次数调整**：只需签到完成挑战赛可以将 `READ_NUM` 设为 2，每次为 30 秒，200即100分钟。
    
 2. **解决阅读时间问题**：对于issue中提出的“阅读时间没有增加”，“增加时间与刷的时间不对等”建议保留`config.py`中的【data】字段，默认阅读三体，其它书籍自行测试。
 
-3. **GitHub Action部署/本地部署**：主要配置config.py即可，Action部署使用环境变量，本地部署修改config.py里的阅读次数、headers、cookies即可。
+3. **GitHub Action部署/本地部署**：Action 部署使用 Secrets/Variables；本地可使用环境变量或修改 `config.py` 的 headers/cookies，阅读次数由 `READ_NUM` 控制且必须为正整数。环境变量 `WXREAD_CURL_BASH` 会覆盖本地 headers/cookies；必须包含非空 `wr_skey` 和 `wr_vid`。
 
-4. **推送**：pushplus推送偶尔出问题，猜测是GitHub action环境问题，增加重试机制。并增加wxpusher的极简推送方式。
+4. **推送**：HTTP 状态与业务状态均通过后才视为服务受理，不保证最终送达。重试有上限且使用短退避，日志不输出 token 或服务原始响应。Telegram 首次请求遵循环境代理，失败后显式禁用环境代理尝试直连。阅读失败退出码为 1；阅读完成但通知未受理为 2；全部成功或未配置推送为 0。
 
 
 ***
+## Cookie 状态与本地验证
+
+服务器设置 `COOKIE_STATE_FILE=state/cookies.json` 可跨运行保存续期结果。Docker 示例挂载 `./state`；状态文件采用原子替换和 `0600` 权限，含登录凭据，不要提交 Git、上传日志或放入公开缓存。状态绑定原始 Cookie 配置，更换账号或重新抓包后不会套用旧配置的状态。损坏的状态文件会明确失败，不会静默继续。
+
+GitHub Actions 每次仍从 `WXREAD_CURL_BASH` Secret 开始；本项目不自动改写 Secrets，也不把 Cookie 状态上传为 artifact/cache。因此 Actions 不能承诺跨任务续期或永久免登录。代理地址可通过 `http_proxy` / `https_proxy` Secrets 配置，工作流会注入运行步骤。
+
+复制浏览器的 Copy as cURL (bash)；支持普通单/双引号、ANSI-C 引号和多行续行，但不会执行 shell。`.env.example` 仅是配置模板，Python 不会自动加载 `.env`；Docker Compose 的 `.env` 插值也不等于向容器注入所有变量，应使用上面的 environment 配置。
+
+```bash
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+# 确认配置后才执行真实阅读
+python main.py
+```
+
+Docker、本地和 Actions 使用同一份固定版本 `requirements.txt`。本 fork 的镜像地址为 `ghcr.io/vkkkv/wxread:latest`；其他 fork 需换成自己的 GHCR 命名空间。
+
 ## 字段解释 🔍
 
 | 字段 | 示例值 | 解释 |
