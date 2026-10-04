@@ -8,7 +8,7 @@ import requests
 
 import os
 
-with patch.dict(os.environ, {"READ_NUM": "", "WXREAD_CURL_BASH": "", "COOKIE_STATE_FILE": "", "PUSH_METHOD": ""}):
+with patch.dict(os.environ, {"READ_NUM": "", "WXREAD_CURL_BASH": "", "PUSH_METHOD": ""}):
     import main
 
 
@@ -34,7 +34,7 @@ class ReadingTests(unittest.TestCase):
         client.post.side_effect = post
         runner = main.ReadingRunner(headers={}, cookies={'wr_skey': 'OLD', 'wr_vid': '1'},
             payload=main.config.data, read_num=1, books=['book'], chapters=['chapter'],
-            client=client, sleep=Mock(), clock=lambda: 1000, persist=Mock())
+            client=client, sleep=Mock(), clock=lambda: 1000)
         return runner, client
 
     def test_import_has_no_network_or_logging_side_effects(self):
@@ -72,13 +72,12 @@ class ReadingTests(unittest.TestCase):
             runner.run()
         self.assertEqual(sum(call.args[0] == main.FIX_SYNCKEY_URL for call in client.post.call_args_list), 3)
 
-    def test_success_uses_copy_and_saves_cookies(self):
+    def test_success_uses_copy_and_renews_cookies_in_memory(self):
         before = copy.deepcopy(main.config.data)
         runner, _ = self.make_runner([response({'succ': 1, 'synckey': 123})])
         self.assertEqual(runner.run(), 1)
         self.assertEqual(main.config.data, before)
         self.assertEqual(runner.cookies['wr_skey'], 'NEWKEY12')
-        runner.persist.assert_called_once_with(runner.cookies)
         runner.sleep.assert_called_once_with(30)
 
     def test_succ_zero_is_not_success(self):
@@ -112,7 +111,7 @@ class ReadingTests(unittest.TestCase):
 
     def run_entry(self, completed=1, error=None, method='telegram', accepted=False):
         with patch('main.setup_logging'), patch('main.config.validate_config'), \
-             patch('main.config.PUSH_METHOD', method), patch('main.load_cookies', return_value={}), \
+             patch('main.config.PUSH_METHOD', method), \
              patch('main.ReadingRunner') as cls, patch('main.push', return_value=accepted) as push:
             cls.return_value.run.return_value = completed
             cls.return_value.run.side_effect = error
@@ -129,36 +128,33 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(status, 1)
         push.assert_called_once_with('fixed diagnostic', 'telegram', is_success=False)
 
-    def test_two_runs_use_persisted_renewal_cookie(self):
-        import os
-        import tempfile
-        from requests.cookies import cookiejar_from_dict
-        with tempfile.TemporaryDirectory() as root:
-            path = os.path.join(root, 'cookies.json')
-            initial = {'wr_skey': 'initial', 'wr_vid': 'vid'}
-            observed = []
-            def request(url, **kwargs):
-                if url == main.RENEW_URL:
-                    observed.append(dict(kwargs['cookies']))
-                    return response({}, cookies={'wr_skey': 'renewed_key'})
-                return response({'succ': 1, 'synckey': 1})
-            with patch.object(main.config, 'COOKIE_STATE_FILE', path):
-                for _ in range(2):
-                    runner = main.ReadingRunner(
-                        headers={}, cookies=main.load_cookies(path, initial),
-                        payload=main.config.data, read_num=1, books=['book'], chapters=['chapter'],
-                        client=Mock(post=Mock(side_effect=request)), sleep=Mock(), progress=Mock(),
-                        persist=lambda current: main.save_cookies(path, initial, current),
-                    )
-                    runner.run()
-            self.assertEqual(observed[0]['wr_skey'], 'initial')
-            self.assertEqual(observed[1]['wr_skey'], 'renewed_')
+    def test_two_runs_start_from_config_and_use_renewal_in_memory(self):
+        initial = {'wr_skey': 'initial', 'wr_vid': 'vid'}
+        observed = []
+        def request(url, **kwargs):
+            observed.append((url, dict(kwargs['cookies'])))
+            if url == main.RENEW_URL:
+                return response({}, cookies={'wr_skey': 'renewed_key'})
+            return response({'succ': 1, 'synckey': 1})
+        with patch.object(main.config, 'cookies', initial), \
+             patch.object(main.config, 'READ_NUM', 1), \
+             patch.object(main.config, 'PUSH_METHOD', ''), \
+             patch.object(main, 'setup_logging', return_value=Mock()), \
+             patch.object(main.requests, 'post', side_effect=request), \
+             patch.object(main.time, 'sleep'):
+            for _ in range(2):
+                self.assertEqual(main.main(), 0)
+        self.assertEqual(initial, {'wr_skey': 'initial', 'wr_vid': 'vid'})
+        self.assertEqual(observed, [
+            (main.RENEW_URL, initial),
+            (main.READ_URL, {'wr_skey': 'renewed_', 'wr_vid': 'vid'}),
+        ] * 2)
 
     def test_entrypoint_invalid_config_fails_without_network(self):
         import os
         import subprocess
         import sys
-        env = {**os.environ, 'WXREAD_CURL_BASH': '', 'COOKIE_STATE_FILE': '', 'PUSH_METHOD': '', 'READ_NUM': '1'}
+        env = {**os.environ, 'WXREAD_CURL_BASH': '', 'PUSH_METHOD': '', 'READ_NUM': '1'}
         result = subprocess.run([sys.executable, main.__file__], env=env, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 1)
         self.assertIn('Required cookie', result.stderr)

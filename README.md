@@ -8,7 +8,7 @@
 
 - **阅读时长调节**：默认计入排行榜和挑战赛，时长可调节，默认 40 次、约 20 分钟（接口是否计时以微信读书实际结果为准）。
 - **定时运行推送**：可部署在GitHub Action/服务器上，支持每天定时运行并推送结果到微信。
-- **Cookie 续期**：运行时尝试续期；服务器可将刷新后的 Cookie 保存到私有状态文件。续期不等于永久登录，登录失效后仍需重新抓包。
+- **Cookie 续期**：运行时尝试续期，刷新后的 Cookie 仅在本次运行的内存中使用。续期不等于永久登录，登录失效后仍需重新抓包。
 - **轻量化设计**：本脚本实现了轻量化的编写，部署服务器/GIthub action后到点运行，无需额外硬件。
 
 ***
@@ -85,7 +85,6 @@ services:
       # 定时任务时间（Cron 表达式）
       CRON_SCHEDULE: "0 1 * * *"
       JOB_TIMEOUT_SECONDS: ""  # 空值自动计算单次任务预算
-      COOKIE_STATE_FILE: "/app/state/cookies.json"
       
       # 可选配置：推送方式 (pushplus/wxpusher/telegram/serverchan)
       PUSH_METHOD: ""
@@ -98,18 +97,16 @@ services:
       WXPUSHER_SPT: ""
       # ServerChan 推送配置
       SERVERCHAN_SPT: ""
-
-    volumes:
-      - ./state:/app/state
 ```
 
 **Cron 定时任务配置：**
 - `0 1 * * *` - 每天凌晨1点（默认）
 - `0 */6 * * *` - 每6小时
 - `30 8 * * *` - 每天早上8:30
-- `0 1 * * 0` / `0 1 * * 7` / `0 1 * * sun` - 每周日凌晨1点
+- `0 1 * * 6` / `0 1 * * sun` - 每周日凌晨1点
+- `0 1 * * 0` / `0 1 * * mon` - 每周一凌晨1点
 
-使用标准五字段 Cron（分、时、日、月、星期），支持列表、范围与步长。日和星期均受限时采用 OR；不支持 `@daily`、`L`、`W` 等扩展。
+使用 APScheduler `CronTrigger` 的五字段格式（分、时、日、月、星期），支持列表、范围与步长。星期从周一开始：`0=mon`、`6=sun`，不接受数字 `7`；`mon-sun` 表示整周。日和星期均受限时必须同时匹配（AND），不是 Unix Cron 的 OR 规则。
 `JOB_TIMEOUT_SECONDS` 必须为正整数；留空时按 `max(3600, READ_NUM * 90 + 900)` 自动计算，超时会终止本次子进程，避免后续定时任务长期被占用。
 
 **步骤2：** 启动容器
@@ -146,11 +143,11 @@ docker-compose exec wxread python /app/main.py
 
 
 ***
-## Cookie 状态与本地验证
+## Cookie 续期与本地验证
 
-服务器设置 `COOKIE_STATE_FILE=state/cookies.json` 可跨运行保存续期结果。Docker 示例挂载 `./state`；状态文件采用原子替换和 `0600` 权限，含登录凭据，不要提交 Git、上传日志或放入公开缓存。状态绑定原始 Cookie 配置，更换账号或重新抓包后不会套用旧配置的状态。损坏的状态文件会明确失败，不会静默继续。
+每次运行均从配置的 Cookie 开始，续期结果只保留在当前进程内存中，不读写 Cookie 状态文件。登录失效后仍需重新抓包并更新配置。
 
-GitHub Actions 每次仍从 `WXREAD_CURL_BASH` Secret 开始；本项目不自动改写 Secrets，也不把 Cookie 状态上传为 artifact/cache。因此 Actions 不能承诺跨任务续期或永久免登录。代理地址可通过 `http_proxy` / `https_proxy` Secrets 配置，工作流会注入运行步骤。
+GitHub Actions 每次仍从 `WXREAD_CURL_BASH` Secret 开始；本项目不自动改写 Secrets，也不上传 Cookie 为 artifact/cache。因此 Actions 不能承诺跨任务续期或永久免登录。代理地址可通过 `http_proxy` / `https_proxy` Secrets 配置，工作流会注入运行步骤。
 
 复制浏览器的 Copy as cURL (bash)；支持普通单/双引号、ANSI-C 引号和多行续行，但不会执行 shell。`.env.example` 仅是配置模板，Python 不会自动加载 `.env`；Docker Compose 的 `.env` 插值也不等于向容器注入所有变量，应使用上面的 environment 配置。
 

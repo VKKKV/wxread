@@ -13,7 +13,7 @@ ENV PATH="/usr/local/bin:${PATH}"
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-COPY main.py push.py config.py cookie_store.py log_utils.py scheduler.py ./
+COPY main.py push.py config.py log_utils.py scheduler.py ./
 
 # 启动命令
 CMD ["python", "scheduler.py"]

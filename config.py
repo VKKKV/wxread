@@ -26,8 +26,6 @@ try:
 except ValueError:
     READ_NUM = 40
     CONFIG_ERROR = "READ_NUM must be a positive integer"
-# 可选 cookie 持久化文件；为空时不进行磁盘读写
-COOKIE_STATE_FILE = os.getenv("COOKIE_STATE_FILE", "")
 # 需要推送时可选，可选pushplus、wxpusher、telegram
 PUSH_METHOD = "" or os.getenv('PUSH_METHOD')
 PUSHPLUS_TOKEN = "" or os.getenv("PUSHPLUS_TOKEN")

@@ -1,13 +1,11 @@
 import logging
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 logging.basicConfig(
@@ -17,90 +15,19 @@ logging.basicConfig(
 )
 
 
-def _parse_field(text, minimum, maximum, names=None, sunday=False):
-    """Parse a five-field Unix cron value to an APScheduler-compatible list."""
-    names = {name.lower(): value for name, value in (names or {}).items()}
-    wildcard = text.startswith("*")
-    values = set()
-
-    def number(token):
-        key = token.lower()
-        if key in names:
-            value = names[key]
-        elif re.fullmatch(r"\d+", token):
-            value = int(token)
-        else:
-            raise ValueError(f"invalid cron field value: {token!r}")
-        if not minimum <= value <= maximum:
-            raise ValueError(f"cron value {token!r} outside {minimum}..{maximum}")
-        return value
-
-    for item in text.split(","):
-        if not item:
-            raise ValueError("empty item in cron field")
-        if "/" in item:
-            if item.count("/") != 1:
-                raise ValueError(f"unsupported cron syntax: {item!r}")
-            base, step_text = item.split("/")
-            if not step_text.isdigit() or int(step_text) < 1:
-                raise ValueError(f"invalid cron step: {step_text!r}")
-            step = int(step_text)
-            if base == "*":
-                start, end = minimum, maximum
-            elif "-" in base:
-                if base.count("-") != 1:
-                    raise ValueError(f"unsupported cron syntax: {item!r}")
-                left, right = base.split("-")
-                start, end = number(left), number(right)
-            else:
-                start, end = number(base), maximum
-            if start > end:
-                raise ValueError(f"descending cron range: {item!r}")
-            values.update(range(start, end + 1, step))
-        elif item == "*":
-            values.update(range(minimum, maximum + 1))
-        elif "-" in item:
-            if item.count("-") != 1:
-                raise ValueError(f"unsupported cron syntax: {item!r}")
-            left, right = item.split("-")
-            start, end = number(left), number(right)
-            if start > end:
-                raise ValueError(f"descending cron range: {item!r}")
-            values.update(range(start, end + 1))
-        else:
-            values.add(number(item))
-
-    # APScheduler numbers weekdays Monday=0; Unix cron Sunday=0.
-    if sunday:
-        values = {(value - 1) % 7 for value in values}
-    return sorted(values), wildcard
-
-
 def parse_cron_schedule(schedule, timezone="Asia/Shanghai"):
-    fields = schedule.split()
+    """Pass five fields directly to CronTrigger, preserving upstream semantics."""
+    fields = schedule.strip().split()
     if len(fields) != 5:
-        raise ValueError(f"invalid cron expression: expected 5 fields, got {len(fields)}")
-    minute, _ = _parse_field(fields[0], 0, 59)
-    hour, _ = _parse_field(fields[1], 0, 23)
-    day, day_wild = _parse_field(fields[2], 1, 31)
-    month, _ = _parse_field(fields[3], 1, 12, {
-        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-    })
-    weekday, weekday_wild = _parse_field(fields[4], 0, 7, {
-        "sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
-    }, sunday=True)
-    # CronTrigger accepts lists as comma-separated strings (not Python lists).
-    minute, hour, month = (",".join(map(str, values)) for values in (minute, hour, month))
-    day, weekday = ",".join(map(str, day)), ",".join(map(str, weekday))
-    common = dict(minute=minute, hour=hour, month=month, timezone=timezone)
-    if not day_wild and not weekday_wild:
-        triggers = [
-            CronTrigger(**common, day=day, day_of_week="*"),
-            CronTrigger(**common, day="*", day_of_week=weekday),
-        ]
-        return OrTrigger(triggers)
-    return CronTrigger(**common, day=day, day_of_week=weekday)
+        raise ValueError(f"无效的 cron 表达式，必须包含 5 个字段: {schedule}")
+    return CronTrigger(
+        minute=fields[0],
+        hour=fields[1],
+        day=fields[2],
+        month=fields[3],
+        day_of_week=fields[4],
+        timezone=timezone,
+    )
 
 
 def _positive_int_env(name, default):

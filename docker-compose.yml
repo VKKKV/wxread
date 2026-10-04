@@ -21,7 +21,6 @@ services:
       CRON_SCHEDULE: "0 1 * * *"
       # 单次任务总预算（秒）；留空按 READ_NUM 自动计算
       JOB_TIMEOUT_SECONDS: ""
-      COOKIE_STATE_FILE: "/app/state/cookies.json"
 
       # 可选配置：推送方式 (pushplus/wxpusher/telegram/serverchan)
       PUSH_METHOD: ""
@@ -34,6 +33,3 @@ services:
       WXPUSHER_SPT: ""
       # ServerChan 推送配置
       SERVERCHAN_SPT: ""
-
-    volumes:
-      - ./state:/app/state

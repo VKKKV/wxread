@@ -6,7 +6,7 @@ import requests
 
 import os
 
-with patch.dict(os.environ, {"READ_NUM": "", "WXREAD_CURL_BASH": "", "COOKIE_STATE_FILE": "", "PUSH_METHOD": ""}):
+with patch.dict(os.environ, {"READ_NUM": "", "WXREAD_CURL_BASH": "", "PUSH_METHOD": ""}):
     import push
 
 

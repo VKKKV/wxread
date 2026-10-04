@@ -9,65 +9,63 @@ import scheduler
 class CronParsingTests(unittest.TestCase):
     tz = "UTC"
 
-    def test_default_schedule_retained(self):
-        trigger = scheduler.parse_cron_schedule("0 1 * * *", self.tz)
-        now = datetime(2026, 1, 1, 0, 0, tzinfo=ZoneInfo(self.tz))
-        self.assertEqual(trigger.get_next_fire_time(None, now), datetime(2026, 1, 1, 1, 0, tzinfo=ZoneInfo(self.tz)))
+    def next_fire(self, expression, now):
+        trigger = scheduler.parse_cron_schedule(expression, self.tz)
+        self.assertIsInstance(trigger, scheduler.CronTrigger)
+        return trigger.get_next_fire_time(None, now)
 
-    def test_unix_sunday_zero_and_seven(self):
-        for weekday in ("0", "7", "sun", "SUN"):
+    def test_default_schedule_retained(self):
+        now = datetime(2026, 1, 1, tzinfo=ZoneInfo(self.tz))
+        self.assertEqual(self.next_fire("0 1 * * *", now), now.replace(hour=1))
+
+    def test_monday_zero_and_sunday_six(self):
+        now = datetime(2026, 1, 5, tzinfo=ZoneInfo(self.tz))
+        for weekday, expected in (("0", 0), ("mon", 0), ("6", 6), ("sun", 6), ("SUN", 6)):
             with self.subTest(weekday=weekday):
-                trigger = scheduler.parse_cron_schedule(f"0 0 * * {weekday}", self.tz)
-                now = datetime(2026, 1, 5, 0, 0, tzinfo=ZoneInfo(self.tz))
-                self.assertEqual(trigger.get_next_fire_time(None, now).weekday(), 6)
+                self.assertEqual(self.next_fire(f"0 0 * * {weekday}", now).weekday(), expected)
+
+    def test_mon_sun_range_covers_whole_week(self):
+        for day in range(5, 12):
+            now = datetime(2026, 1, day, tzinfo=ZoneInfo(self.tz))
+            self.assertEqual(self.next_fire("0 0 * * mon-sun", now), now)
 
     def test_weekday_names_and_lists_ranges_steps(self):
         trigger = scheduler.parse_cron_schedule("*/15 8-10/2 * jan,mar mon-fri", self.tz)
         now = datetime(2026, 1, 5, 7, 59, tzinfo=ZoneInfo(self.tz))
         first = trigger.get_next_fire_time(None, now)
-        self.assertEqual(first, datetime(2026, 1, 5, 8, 0, tzinfo=ZoneInfo(self.tz)))
-        self.assertEqual(trigger.get_next_fire_time(first, first), datetime(2026, 1, 5, 8, 15, tzinfo=ZoneInfo(self.tz)))
+        self.assertEqual(first, now.replace(hour=8, minute=0))
+        self.assertEqual(trigger.get_next_fire_time(first, first), first.replace(minute=15))
 
-    def test_day_and_weekday_are_or_when_both_restricted(self):
-        trigger = scheduler.parse_cron_schedule("0 0 1 * mon", self.tz)
+    def test_day_and_weekday_must_both_match(self):
         now = datetime(2026, 1, 1, 0, 1, tzinfo=ZoneInfo(self.tz))
-        first = trigger.get_next_fire_time(None, now)
-        self.assertEqual(first, datetime(2026, 1, 5, 0, 0, tzinfo=ZoneInfo(self.tz)))
-        next_fire = trigger.get_next_fire_time(first, first)
-        self.assertEqual(next_fire, datetime(2026, 1, 12, 0, 0, tzinfo=ZoneInfo(self.tz)))
+        self.assertEqual(self.next_fire("0 0 1 * mon", now),
+                         datetime(2026, 6, 1, tzinfo=ZoneInfo(self.tz)))
 
-    def test_star_step_is_from_field_minimum(self):
-        trigger = scheduler.parse_cron_schedule("0 */6 * * *", self.tz)
-        now = datetime(2026, 1, 1, 0, 1, tzinfo=ZoneInfo(self.tz))
-        self.assertEqual(trigger.get_next_fire_time(None, now), datetime(2026, 1, 1, 6, 0, tzinfo=ZoneInfo(self.tz)))
-
-    def test_ranges_include_sunday_seven(self):
-        values, _ = scheduler._parse_field('1-7', 0, 7, sunday=True)
-        self.assertEqual(values, list(range(7)))
-        values, _ = scheduler._parse_field('5-7/2', 0, 7, sunday=True)
-        self.assertEqual(values, [4, 6])
-
-    def test_star_steps_preserved_in_day_and_weekday(self):
-        trigger = scheduler.parse_cron_schedule('0 0 */2 * *', self.tz)
-        now = datetime(2026, 1, 2, tzinfo=ZoneInfo(self.tz))
-        self.assertEqual(trigger.get_next_fire_time(None, now).day, 3)
-        trigger = scheduler.parse_cron_schedule('0 0 * * */2', self.tz)
-        now = datetime(2026, 1, 5, tzinfo=ZoneInfo(self.tz))
-        self.assertEqual(trigger.get_next_fire_time(None, now).weekday(), 1)
-
-    def test_single_value_step(self):
-        trigger = scheduler.parse_cron_schedule('5/15 * * * *', self.tz)
+    def test_star_and_single_value_steps(self):
         now = datetime(2026, 1, 1, 0, 6, tzinfo=ZoneInfo(self.tz))
-        self.assertEqual(trigger.get_next_fire_time(None, now).minute, 20)
+        self.assertEqual(self.next_fire("0 */6 * * *", now), now.replace(hour=6, minute=0))
+        self.assertEqual(self.next_fire("5/15 * * * *", now), now.replace(minute=20))
+        now = datetime(2026, 1, 2, tzinfo=ZoneInfo(self.tz))
+        self.assertEqual(self.next_fire("0 0 */2 * *", now).day, 3)
+        now = datetime(2026, 1, 5, tzinfo=ZoneInfo(self.tz))
+        self.assertEqual(self.next_fire("0 0 * * */2", now).weekday(), 0)
 
-    @patch.object(scheduler.BlockingScheduler, 'start')
-    def test_main_can_start_or_trigger(self, start):
-        with patch.dict('os.environ', {'CRON_SCHEDULE': '0 1 1 * mon', 'TZ': 'UTC', 'JOB_TIMEOUT_SECONDS': ''}, clear=True):
+    @patch.object(scheduler, 'BlockingScheduler')
+    def test_main_starts_cron_trigger_and_preserves_job_protections(self, cls):
+        cls.return_value.timezone = ZoneInfo(self.tz)
+        with patch.dict('os.environ', {'CRON_SCHEDULE': '0 1 1 * mon', 'TZ': self.tz,
+                                      'JOB_TIMEOUT_SECONDS': ''}, clear=True):
             scheduler.main()
-        start.assert_called_once()
+        cls.assert_called_once_with(timezone=self.tz)
+        args, kwargs = cls.return_value.add_job.call_args
+        self.assertIs(args[0], scheduler.run_job)
+        self.assertIsInstance(args[1], scheduler.CronTrigger)
+        self.assertEqual(kwargs, dict(max_instances=1, coalesce=True, misfire_grace_time=3600))
+        cls.return_value.start.assert_called_once()
 
-    def test_rejects_invalid_and_unsupported_syntax(self):
-        for expression in ("* * * *", "60 * * * *", "*/0 * * * *", "mon-fri/2 * * * *", "1,,2 * * * *", "5-1 * * * *", "? * * * *"):
+    def test_rejects_invalid_fields_using_cron_trigger(self):
+        for expression in ("* * * *", "* * * * * *", "60 * * * *", "*/0 * * * *",
+                           "mon-fri/2 * * * *", "5-1 * * * *", "? * * * *", "0 0 * * 7"):
             with self.subTest(expression=expression), self.assertRaises(ValueError):
                 scheduler.parse_cron_schedule(expression, self.tz)
 

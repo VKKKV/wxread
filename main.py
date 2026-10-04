@@ -10,7 +10,6 @@ import urllib.parse
 import requests
 
 import config
-from cookie_store import load_cookies, save_cookies
 from log_utils import setup_logging
 from push import push
 
@@ -48,7 +47,7 @@ class ReadingRunner:
     """每次运行拥有独立状态；所有恢复分支共享连续失败预算。"""
 
     def __init__(self, *, headers, cookies, payload, read_num, books, chapters,
-                 client=None, sleep=None, clock=None, progress=None, persist=None):
+                 client=None, sleep=None, clock=None, progress=None):
         if not isinstance(read_num, int) or isinstance(read_num, bool) or read_num <= 0:
             raise ValueError("READ_NUM 必须为正整数。")
         if not books or not chapters:
@@ -63,7 +62,6 @@ class ReadingRunner:
         self.sleep = time.sleep if sleep is None else sleep
         self.clock = time.time if clock is None else clock
         self.progress = progress or (lambda message: None)
-        self.persist = persist or (lambda cookies: None)
 
     def post(self, url, payload):
         try:
@@ -84,7 +82,6 @@ class ReadingRunner:
                     self.cookies.update(response.cookies.get_dict())
                     # 保留既有逆向协议的八字符 skey，勿凭猜测改变签名协议。
                     self.cookies['wr_skey'] = new_skey[:8]
-                    self.persist(self.cookies)
                     logging.info("cookie 刷新成功。")
                     return True
             except requests.RequestException as exc:
@@ -163,17 +160,14 @@ def main():
     method = config.PUSH_METHOD
     try:
         config.validate_config()
-        base_cookies = dict(config.cookies)
-        current_cookies = load_cookies(config.COOKIE_STATE_FILE, base_cookies)
         runner = ReadingRunner(
-            headers=config.headers, cookies=current_cookies, payload=config.data,
+            headers=config.headers, cookies=config.cookies, payload=config.data,
             read_num=config.READ_NUM, books=config.book, chapters=config.chapter,
             progress=progress,
-            persist=lambda cookies: save_cookies(config.COOKIE_STATE_FILE, base_cookies, cookies),
         )
         completed = runner.run()
     except (ValueError, RuntimeError) as exc:
-        # 自有异常只含固定诊断，底层请求/状态文件错误必须先脱敏。
+        # 自有异常只含固定诊断，底层请求错误必须先脱敏。
         message = str(exc)
         logging.error("%s", message)
         if method and not push(message, method, is_success=False):
