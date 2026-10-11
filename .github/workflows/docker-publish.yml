@@ -14,18 +14,97 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
+  tests:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run offline tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m unittest discover -s tests -v
+
+  build-and-push:
+    needs: tests
+    runs-on: ubuntu-latest
+    # Cancel stale builds, never an in-flight mutable-tag promotion.
+    concurrency:
+      group: docker-build-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
       packages: write
+    outputs:
+      image: ${{ steps.names.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+      immutable: ${{ steps.names.outputs.immutable }}
+      tags: ${{ steps.meta.outputs.tags }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Prepare immutable image name
+        id: names
+        env:
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME,,}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          # The suffix also prevents a rerun from overwriting the same SHA tag.
+          echo "immutable=$image:sha-$SHA-$RUN_ID-$RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Build smoke-test image without publishing
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: wxread-smoke:local
+          cache-from: type=gha
+
+      - name: Smoke test real image without credentials or network
+        run: |
+          docker run --rm --network none --entrypoint python wxread-smoke:local -c '
+          import config, log_utils, main, push, scheduler
+          if config.cookies:
+              raise SystemExit("Smoke test must have no cookies")
+          try:
+              config.validate_config()
+          except ValueError as exc:
+              if not str(exc).startswith("Required cookie is missing or empty:"):
+                  raise
+          else:
+              raise SystemExit("Missing credentials were accepted")
+          print("Imports and missing-credential rejection passed")
+          '
+          # Exercise the actual image CMD; a scheduler hang must fail this gate.
+          set +e
+          output=$(timeout 15s docker run --rm --network none \
+            -e CRON_SCHEDULE='0 1 31 2 *' wxread-smoke:local 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$status" -eq 1
+          [[ "$output" == *'CRON_SCHEDULE has no future fire time'* ]]
+          [[ "$output" != *'调度器已启动'* ]]
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -38,7 +117,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.names.outputs.image }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -46,14 +125,120 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long,suffix=-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Build and push Docker image
+      - name: Build and push immutable multi-platform image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.names.outputs.immutable }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
+
+  promote:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # Serialize ALL mutable tags for this image (including overlapping semver
+    # aliases). A cancelled build cannot interrupt a registry write here.
+    concurrency:
+      group: docker-promotion-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote only the current ref HEAD
+        env:
+          SOURCE_IMAGE: ${{ needs.build-and-push.outputs.image }}
+          SOURCE_DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          IMMUTABLE_TAG: ${{ needs.build-and-push.outputs.immutable }}
+          TAGS: ${{ needs.build-and-push.outputs.tags }}
+          EXPECTED_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          current_head() {
+            local refs
+            refs=$(git ls-remote --exit-code origin "$SOURCE_REF" "${SOURCE_REF}^{}") || return
+            # Annotated tags need the peeled commit, not the tag object's SHA.
+            REFS="$refs" python -c '
+          import os
+          refs = [line.split() for line in os.environ["REFS"].splitlines()]
+          peeled = [sha for sha, ref in refs if ref.endswith("^{}")]
+          print(peeled[0] if peeled else refs[0][0])
+          '
+          }
+          [[ "$SOURCE_DIGEST" == sha256:* ]]
+          while IFS= read -r tag; do
+            test -n "$tag" || continue
+            # Already published in build-and-push; never rewrite immutable tags.
+            [[ "$tag" != "$IMMUTABLE_TAG" ]] || continue
+            head=$(current_head)
+            if [[ "$head" != "$EXPECTED_SHA" ]]; then
+              echo 'Ref moved; skipping stale mutable-tag promotion.'
+              exit 0
+            fi
+            # Shared semver aliases must not be rolled back by an older tag run.
+            # Check all remote release tags, not merely this run's unchanged ref.
+            case "$SOURCE_REF" in
+              refs/tags/*)
+                release_refs=$(git ls-remote --tags origin) # failure closes the gate
+                eligible=$(RELEASE_REFS="$release_refs" TARGET_TAG="$tag" python -c '
+          import os, re
+          pattern = r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\+[0-9A-Za-z.-]+)?"
+          source = os.environ["SOURCE_REF"].removeprefix("refs/tags/")
+          match = re.fullmatch(pattern, source)
+          alias = os.environ["TARGET_TAG"].rsplit(":", 1)[-1]
+          if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", alias):
+              if not match:
+                  print("no")  # prereleases never qualify for stable aliases
+              else:
+                  version = tuple(map(int, match.groups()))
+                  prefix = tuple(map(int, alias.split(".")))
+                  releases = []
+                  for line in os.environ["RELEASE_REFS"].splitlines():
+                      _, ref = line.split()
+                      candidate = re.fullmatch(pattern, ref.removeprefix("refs/tags/"))
+                      if candidate:
+                          releases.append(tuple(map(int, candidate.groups())))
+                  newer = any(v[:len(prefix)] == prefix and v > version for v in releases)
+                  print("yes" if version[:len(prefix)] == prefix and not newer else "no")
+          else:
+              print("yes")
+          ')
+                if [[ "$eligible" != yes ]]; then
+                  echo 'Skipping an outdated or ineligible shared version alias.'
+                  continue
+                fi
+                ;;
+            esac
+            docker buildx imagetools create --tag "$tag" "$SOURCE_IMAGE@$SOURCE_DIGEST"
+            docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | python -c '
+          import json, os, sys
+          actual = json.load(sys.stdin)["digest"]
+          if actual != os.environ["SOURCE_DIGEST"]:
+              raise SystemExit("Promoted tag digest does not match the tested build")
+          print("Verified promoted digest:", actual)
+          '
+          done <<< "$TAGS"
+          # GitHub HEAD and GHCR tag writes are not a cross-service transaction:
+          # a ref can still move during a write. Serialization prevents an older
+          # promoter from overwriting a newer completed promoter for the same ref.
+          # Shared stable major/minor aliases additionally require no newer remote
+          # release tag in that series. Ref/tag discovery and GHCR writes still
+          # have a non-atomic window; a newer tag that never publishes can leave
+          # the previous successful alias in place.

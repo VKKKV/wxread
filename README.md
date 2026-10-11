@@ -107,6 +107,7 @@ services:
 - `0 1 * * 0` / `0 1 * * mon` - 每周一凌晨1点
 
 使用 APScheduler `CronTrigger` 的五字段格式（分、时、日、月、星期），支持列表、范围与步长。星期从周一开始：`0=mon`、`6=sun`，不接受数字 `7`；`mon-sun` 表示整周。日和星期均受限时必须同时匹配（AND），不是 Unix Cron 的 OR 规则。
+没有未来执行日期的组合（例如 `0 1 31 2 *`）会在启动时以配置错误退出，不会保持一个永远不执行的调度器。
 `JOB_TIMEOUT_SECONDS` 必须为正整数；留空时按 `max(3600, READ_NUM * 90 + 900)` 自动计算，超时会终止本次子进程，避免后续定时任务长期被占用。
 
 **步骤2：** 启动容器
@@ -128,7 +129,9 @@ docker-compose exec wxread python /app/main.py
 **Docker 说明：**
 - 镜像地址：`ghcr.io/vkkkv/wxread:latest`
 - 支持多架构：linux/amd64 和 linux/arm64
-- 推送代码到仓库会自动构建最新镜像
+- main/master 推送、v* 标签和手动运行会触发镜像流程；离线测试及真实镜像的无网络 smoke check 通过后才发布多架构镜像。
+- 每次构建发布独立的 `sha-完整提交SHA-run_id-run_attempt` 标签；可变标签（main/latest/版本别名）按 digest 串行提升，提升前核对远端 ref HEAD，完成后读回 digest。
+- 过时 ref 不提升可变标签；稳定 major/minor 别名还要求远端同版本系列没有更新的稳定 release tag，防止延迟的旧版本覆盖新版本。GitHub ref/tag 与 GHCR 写入不是原子事务，仍有检查至写入期间 ref/tag 变化的窗口；较新 tag 若构建失败，别名可能停留在此前成功版本。
 
 ***
 ## Attention 📢
@@ -140,6 +143,7 @@ docker-compose exec wxread python /app/main.py
 3. **GitHub Action部署/本地部署**：Action 部署使用 Secrets/Variables；本地可使用环境变量或修改 `config.py` 的 headers/cookies，阅读次数由 `READ_NUM` 控制且必须为正整数。环境变量 `WXREAD_CURL_BASH` 会覆盖本地 headers/cookies；必须包含非空 `wr_skey` 和 `wr_vid`。
 
 4. **推送**：HTTP 状态与业务状态均通过后才视为服务受理，不保证最终送达。重试有上限且使用短退避，日志不输出 token 或服务原始响应。Telegram 首次请求遵循环境代理，失败后显式禁用环境代理尝试直连。阅读失败退出码为 1；阅读完成但通知未受理为 2；全部成功或未配置推送为 0。
+   阅读和通知的固定认证接口均不自动跟随重定向，避免向其他主机转发 Cookie、token 或通知内容；通知必须满足 HTTP 2xx。Telegram 首次请求支持 Requests 标准大小写代理变量及 `ALL_PROXY` / `NO_PROXY`。
 
 
 ***
@@ -149,7 +153,7 @@ docker-compose exec wxread python /app/main.py
 
 GitHub Actions 每次仍从 `WXREAD_CURL_BASH` Secret 开始；本项目不自动改写 Secrets，也不上传 Cookie 为 artifact/cache。因此 Actions 不能承诺跨任务续期或永久免登录。代理地址可通过 `http_proxy` / `https_proxy` Secrets 配置，工作流会注入运行步骤。
 
-复制浏览器的 Copy as cURL (bash)；支持普通单/双引号、ANSI-C 引号和多行续行，但不会执行 shell。`.env.example` 仅是配置模板，Python 不会自动加载 `.env`；Docker Compose 的 `.env` 插值也不等于向容器注入所有变量，应使用上面的 environment 配置。
+复制浏览器的 Copy as cURL (bash)；支持普通单/双引号、ANSI-C 引号和多行续行，但不会执行 shell、变量展开或文件读取。解析器只提取显式 header/cookie，按参数数目跳过已知 data/url/request/user-agent/referer 选项；未知选项、组合短开关和引号外 shell 操作符会安全拒绝。输入最多 65536 字符、4096 个 token，ANSI-C 使用严格 UTF-8 转义子集。`.env.example` 仅是配置模板，Python 不会自动加载 `.env`；Docker Compose 的 `.env` 插值也不等于向容器注入所有变量，应使用上面的 environment 配置。
 
 ```bash
 python -m pip install -r requirements.txt
