@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 
 import requests
@@ -25,10 +24,6 @@ class PushNotification:
         self.server_chan_url = "https://sctapi.ftqq.com/{}.send"
         self.wxpusher_simple_url = "https://wxpusher.zjiecode.com/api/send/message/simple-push"
         self.headers = {"Content-Type": "application/json"}
-        self.proxies = {
-            "http": os.getenv("http_proxy"),
-            "https": os.getenv("https_proxy"),
-        }
 
     @staticmethod
     def _failure(provider, exc):
@@ -42,11 +37,18 @@ class PushNotification:
         except (ValueError, TypeError):
             return None
 
+    @staticmethod
+    def _check_status(response):
+        response.raise_for_status()
+        # Requests does not reject 1xx/3xx; only 2xx means HTTP acceptance.
+        if not 200 <= response.status_code < 300:
+            raise requests.HTTPError("Notification HTTP status rejected", response=response)
+
     def _request_with_retries(self, provider, request, success):
         for attempt in range(self.ATTEMPTS):
             try:
                 response = request()
-                response.raise_for_status()
+                self._check_status(response)
                 if success(self._json(response)):
                     return True
                 logger.error("%s 推送失败 (business response rejected)", provider)
@@ -63,7 +65,7 @@ class PushNotification:
         payload = {"token": token, "title": title, "content": content}
         return self._request_with_retries(
             "PushPlus",
-            lambda: requests.post(self.pushplus_url, json=payload, headers=self.headers, timeout=10),
+            lambda: requests.post(self.pushplus_url, json=payload, headers=self.headers, timeout=10, allow_redirects=False),
             lambda data: isinstance(data, dict) and type(data.get("code")) is int and data["code"] == 200,
         )
 
@@ -74,8 +76,9 @@ class PushNotification:
         payload = {"chat_id": chat_id, "text": content}
 
         try:
-            response = requests.post(url, json=payload, proxies=self.proxies, timeout=10)
-            response.raise_for_status()
+            # Let Requests discover HTTPS_PROXY/ALL_PROXY/NO_PROXY normally.
+            response = requests.post(url, json=payload, timeout=10, allow_redirects=False)
+            self._check_status(response)
             data = self._json(response)
             if isinstance(data, dict) and data.get("ok") is True:
                 return True
@@ -88,7 +91,7 @@ class PushNotification:
         try:
             return self._request_with_retries(
                 "Telegram direct",
-                lambda: session.post(url, json=payload, timeout=10),
+                lambda: session.post(url, json=payload, timeout=10, allow_redirects=False),
                 lambda data: isinstance(data, dict) and data.get("ok") is True,
             )
         finally:
@@ -100,7 +103,7 @@ class PushNotification:
         payload = {"spt": spt, "content": content, "contentType": 1}
         return self._request_with_retries(
             "WxPusher",
-            lambda: requests.post(self.wxpusher_simple_url, json=payload, headers=self.headers, timeout=10),
+            lambda: requests.post(self.wxpusher_simple_url, json=payload, headers=self.headers, timeout=10, allow_redirects=False),
             lambda data: isinstance(data, dict) and type(data.get("code")) is int and data["code"] == 1000,
         )
 
@@ -111,7 +114,7 @@ class PushNotification:
         payload = {"title": title, "desp": content}
         return self._request_with_retries(
             "ServerChan",
-            lambda: requests.post(self.server_chan_url.format(spt), json=payload, headers=self.headers, timeout=10),
+            lambda: requests.post(self.server_chan_url.format(spt), json=payload, headers=self.headers, timeout=10, allow_redirects=False),
             lambda data: isinstance(data, dict) and type(data.get("code")) is int and data["code"] == 0,
         )
 

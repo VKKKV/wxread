@@ -2,6 +2,7 @@ import copy
 import importlib
 import unittest
 from unittest.mock import Mock, call, patch
+from requests.adapters import HTTPAdapter
 from requests.cookies import cookiejar_from_dict
 
 import requests
@@ -36,6 +37,51 @@ class ReadingTests(unittest.TestCase):
             payload=main.config.data, read_num=1, books=['book'], chapters=['chapter'],
             client=client, sleep=Mock(), clock=lambda: 1000)
         return runner, client
+
+    def test_authenticated_endpoints_reject_redirects_without_forwarding_cookies(self):
+        session = requests.Session()
+        session.trust_env = False
+        runner, _ = self.make_runner([])
+        runner.client = session
+        canary = 'FAKE_COOKIE_ONLY'
+        runner.cookies = {'wr_skey': canary, 'wr_vid': 'FAKE_ID'}
+        seen = []
+
+        def send(adapter, request, **kwargs):
+            seen.append(request)
+            result = requests.Response()
+            result.request = request
+            result.url = request.url
+            result.status_code = 302 if request.url != 'http://capture.invalid/collect' else 200
+            if result.status_code == 302:
+                result.headers['Location'] = 'http://capture.invalid/collect'
+            result._content = b'{}'
+            return result
+
+        try:
+            for url in (main.READ_URL, main.RENEW_URL, main.FIX_SYNCKEY_URL):
+                with self.subTest(url=url), patch.object(HTTPAdapter, 'send', new=send):
+                    before = len(seen)
+                    with self.assertRaises(requests.HTTPError):
+                        runner.post(url, {})
+                    self.assertEqual(len(seen), before + 1)
+                    self.assertEqual(seen[-1].url, url)
+                    self.assertIn(canary, seen[-1].headers['Cookie'])
+        finally:
+            session.close()
+
+    def test_authenticated_endpoints_require_http_2xx(self):
+        runner, client = self.make_runner([])
+        for status in (199, 300, 304):
+            with self.subTest(status=status):
+                client.post.return_value = None
+                result = requests.Response()
+                result.status_code = status
+                result._content = b'{}'
+                client.post.side_effect = None
+                client.post.return_value = result
+                with self.assertRaises(requests.HTTPError):
+                    runner.post(main.READ_URL, {})
 
     def test_import_has_no_network_or_logging_side_effects(self):
         with patch('requests.post') as post, patch('main.setup_logging') as logging:

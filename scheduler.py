@@ -73,6 +73,9 @@ def main():
     logging.info("使用时区: %s", timezone)
     logging.info("解析定时规则 (CRON_SCHEDULE): %s", cron_schedule)
     trigger = parse_cron_schedule(cron_schedule, timezone)
+    next_run = trigger.get_next_fire_time(None, datetime.now(trigger.timezone))
+    if next_run is None:
+        raise ValueError("CRON_SCHEDULE has no future fire time")
     scheduler = BlockingScheduler(timezone=timezone)
     scheduler.add_job(
         run_job,
@@ -81,7 +84,6 @@ def main():
         coalesce=True,
         misfire_grace_time=3600,
     )
-    next_run = trigger.get_next_fire_time(None, datetime.now(scheduler.timezone))
     logging.info("调度器已启动。下一次任务执行时间: %s", next_run)
     scheduler.start()
 

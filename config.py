@@ -1,7 +1,6 @@
 # config.py 自定义配置,包括阅读次数、推送token的填写
 import os
 import re
-import shlex
 
 """
 可修改区域
@@ -121,38 +120,79 @@ def _decode_ansi(raw):
 
 
 def _shell_tokens(command):
-    """Tokenize curl, decoding ANSI-C only outside ordinary quoted strings."""
-    output, quote, i = [], None, 0
+    """Read a bounded literal Bash-quoting subset, never evaluate shell code.
+
+    Support single/double/ANSI-C quotes, adjacent fragments and LF/CRLF
+    continuations (except inside single/ANSI-C quotes). Expansion text stays
+    literal, including $'...' inside double quotes. Shell operators outside
+    quotes are rejected; this is not a general shell parser. Accept at most
+    65536 input characters and 4096 tokens. ANSI-C uses _decode_ansi's strict
+    UTF-8 escape subset; unknown escapes and NUL are rejected.
+    """
+    if not isinstance(command, str) or len(command) > 65536 or '\x00' in command:
+        raise ValueError("Unsupported curl quoting format")
+    tokens, word, quote, started, i = [], [], None, False, 0
     while i < len(command):
         char = command[i]
         if quote == "'":
-            output.append(char)
             if char == "'":
                 quote = None
+            else:
+                word.append(char)
             i += 1
         elif char == '\\':
-            output.append(command[i:i + 2])
-            i += 2
+            if i + 1 >= len(command):
+                raise ValueError("Unsupported curl quoting format")
+            if command.startswith('\\\r\n', i):
+                i += 3
+            elif command[i + 1] == '\n':
+                i += 2
+            elif quote == '"' and command[i + 1] not in '$`"\\':
+                word.append('\\')
+                i += 1
+            else:
+                word.append(command[i + 1])
+                started = True
+                i += 2
         elif quote == '"':
-            output.append(char)
             if char == '"':
                 quote = None
+            else:
+                word.append(char)
             i += 1
         elif command.startswith("$'", i):
-            match = re.match(r"\$'((?:\\.|[^'\\])*)'", command[i:])
-            if not match:
+            # Scan once, preserving escape pairs for the ANSI-C decoder.
+            end = i + 2
+            while end < len(command) and command[end] != "'":
+                end += 2 if command[end] == '\\' else 1
+            if end >= len(command):
                 raise ValueError("Unsupported curl quoting format")
-            output.append(shlex.quote(_decode_ansi(match.group(1))))
-            i += len(match.group())
-        else:
-            output.append(char)
-            if char in ("'", '"'):
-                quote = char
+            word.append(_decode_ansi(command[i + 2:end]))
+            started = True
+            i = end + 1
+        elif char in ("'", '"'):
+            quote, started = char, True
             i += 1
-    try:
-        return shlex.split(''.join(output), posix=True, comments=False)
-    except ValueError:
-        raise ValueError("Unsupported curl quoting format") from None
+        elif char in ' \t\r\n':
+            if started:
+                tokens.append(''.join(word))
+                word, started = [], False
+                if len(tokens) > 4096:
+                    raise ValueError("Unsupported curl quoting format")
+            i += 1
+        elif char in ';|&<>()':
+            raise ValueError("Unsupported curl quoting format")
+        else:
+            word.append(char)
+            started = True
+            i += 1
+    if quote is not None:
+        raise ValueError("Unsupported curl quoting format")
+    if started:
+        tokens.append(''.join(word))
+    if len(tokens) > 4096:
+        raise ValueError("Unsupported curl quoting format")
+    return tokens
 
 
 def _cookie_pairs(value):
@@ -171,31 +211,57 @@ def _cookie_pairs(value):
 
 
 def convert(curl_command):
-    """解析 curl headers/cookies，不执行命令；不支持的 header/cookie 格式会报错。"""
-    tokens = _shell_tokens(curl_command.replace("\\\r\n", " ").replace("\\\n", " "))
+    """Extract only explicit -H/--header and -b/--cookie values; never run curl.
+
+    Require a literal curl command. Known value options consume exactly one
+    argument even if it looks like -H/-b; attached short and --name=value forms
+    are accepted. Other request options/URLs are ignored, not replayed. Reject
+    unknown options and short switch clusters rather than guessing their arity.
+    -- ends option parsing. No expansion, file reads or shell execution occurs.
+    """
+    tokens = _shell_tokens(curl_command)
+    if not tokens or tokens[0] != 'curl':
+        raise ValueError("Unsupported curl command format")
+    value_options = {
+        '-H', '--header', '-b', '--cookie', '--data-raw', '-d', '--data',
+        '--data-binary', '--url', '-X', '--request', '-A', '--user-agent',
+        '-e', '--referer',
+    }
+    switches = {
+        '--compressed', '--location', '-L', '--insecure', '-k',
+        '--silent', '-s', '--show-error', '-S', '--http1.1', '--http2',
+        '--globoff', '-g',
+    }
     result_headers, result_cookies = {}, {}
-    i = 0
+    i = 1
     while i < len(tokens):
         token = tokens[i]
+        i += 1
+        if token == '--':
+            break
+        if token in switches:
+            continue
+        if not token.startswith('-') or token == '-':
+            continue  # Positional URL, never an option argument.
         option, attached = token, None
-        if token.startswith(('-H=', '--header=', '-b=', '--cookie=')):
-            option, attached = token.split('=', 1)
-        elif token in ('-H', '--header', '-b', '--cookie'):
-            i += 1
+        if token.startswith('--'):
+            if '=' in token:
+                option, attached = token.split('=', 1)
+        else:
+            option = token[:2]
+            if len(token) > 2:
+                attached = token[2:]
+                # Preserve the existing -H=/-b= input contract.
+                if option in ('-H', '-b') and attached.startswith('='):
+                    attached = attached[1:]
+        if option not in value_options:
+            raise ValueError("Unsupported curl option")
+        if attached is None:
             if i >= len(tokens):
-                raise ValueError("Missing curl header/cookie argument")
+                raise ValueError("Missing curl option argument")
             attached = tokens[i]
-        elif token.startswith('-H') and token != '-H':
-            attached = token[2:]
-            option = '-H'
-        elif token.startswith('-b') and token != '-b':
-            attached = token[2:]
-            option = '-b'
-        elif token.startswith('--header='):
-            option, attached = '--header', token[len('--header='):]
-        elif token.startswith('--cookie='):
-            option, attached = '--cookie', token[len('--cookie='):]
-        if option in ('-H', '--header') and attached is not None:
+            i += 1
+        if option in ('-H', '--header'):
             if ':' not in attached:
                 raise ValueError("Unsupported curl header format")
             key, value = attached.split(':', 1)
@@ -206,9 +272,8 @@ def convert(curl_command):
                 result_cookies.update(_cookie_pairs(value))
             else:
                 result_headers[key] = value
-        elif option in ('-b', '--cookie') and attached is not None:
+        elif option in ('-b', '--cookie'):
             result_cookies.update(_cookie_pairs(attached))
-        i += 1
     return result_headers, result_cookies
 
 

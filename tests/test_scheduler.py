@@ -1,5 +1,9 @@
+import os
+import subprocess
+import sys
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -62,6 +66,28 @@ class CronParsingTests(unittest.TestCase):
         self.assertIsInstance(args[1], scheduler.CronTrigger)
         self.assertEqual(kwargs, dict(max_instances=1, coalesce=True, misfire_grace_time=3600))
         cls.return_value.start.assert_called_once()
+
+    @patch.object(scheduler, 'BlockingScheduler')
+    def test_impossible_schedule_rejected_before_scheduler_creation(self, cls):
+        cls.return_value.timezone = ZoneInfo(self.tz)
+        now = datetime(2026, 1, 1, tzinfo=ZoneInfo(self.tz))
+        self.assertIsNone(self.next_fire('0 1 31 2 *', now))
+        with patch.dict('os.environ', {'CRON_SCHEDULE': '0 1 31 2 *', 'TZ': self.tz}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'no future fire time'):
+                scheduler.main()
+        cls.assert_not_called()
+
+    def test_impossible_schedule_cli_exits_with_configuration_error(self):
+        env = {'PATH': os.environ.get('PATH', ''), 'PYTHONDONTWRITEBYTECODE': '1',
+               'CRON_SCHEDULE': '0 1 31 2 *', 'TZ': self.tz}
+        result = subprocess.run(
+            [sys.executable, str(Path(scheduler.__file__).resolve())],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('no future fire time', result.stdout + result.stderr)
+        self.assertNotIn('调度器已启动', result.stdout + result.stderr)
+        self.assertNotIn('Traceback', result.stdout + result.stderr)
 
     def test_rejects_invalid_fields_using_cron_trigger(self):
         for expression in ("* * * *", "* * * * * *", "60 * * * *", "*/0 * * * *",

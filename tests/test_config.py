@@ -55,6 +55,114 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.convert('curl -b "a=$\'hello\';wr_skey=k;wr_vid=v"')[1]['a'], "$'hello'")
         self.assertEqual(config.convert("curl -b='a=1;b=2'")[1], {'a': '1', 'b': '2'})
 
+    def test_double_quoted_bash_backslash_rules(self):
+        config = self.load_config()
+        headers, cookies = config.convert(
+            r'''curl -H "X-Literal: \$cash\`tick\`\q\\\"" -b "wr_skey=\$key\`id\`;wr_vid=v"'''
+        )
+        self.assertEqual(headers, {'X-Literal': '$cash`tick`\\q\\"'})
+        self.assertEqual(cookies, {'wr_skey': '$key`id`', 'wr_vid': 'v'})
+
+    def test_option_arguments_cannot_override_cookies(self):
+        config = self.load_config()
+        for option in ('--data-raw', '-d', '--data', '--data-binary', '--url',
+                       '-X', '--request', '-A', '--user-agent', '-e', '--referer'):
+            with self.subTest(option=option):
+                headers, cookies = config.convert(
+                    "curl -b 'wr_skey=GOOD;wr_vid=real' " + option +
+                    " '-bwr_skey=BAD;wr_vid=evil' --compressed"
+                )
+                self.assertEqual(headers, {})
+                self.assertEqual(cookies, {'wr_skey': 'GOOD', 'wr_vid': 'real'})
+
+    def test_option_arguments_cannot_inject_headers(self):
+        config = self.load_config()
+        for option in ('--data-raw', '-d', '--data', '--data-binary', '--url',
+                       '-X', '--request', '-A', '--user-agent', '-e', '--referer'):
+            for payload in ("-HCookie: wr_skey=BAD;wr_vid=evil", "--cookie=wr_skey=BAD;wr_vid=evil"):
+                with self.subTest(option=option, payload=payload):
+                    self.assertEqual(
+                        config.convert("curl " + option + " '" + payload + "' -H 'X-Good: yes'"),
+                        ({'X-Good': 'yes'}, {})
+                    )
+
+    def test_joined_quotes_and_contextual_continuations(self):
+        config = self.load_config()
+        for newline in ('\n', '\r\n'):
+            with self.subTest(newline=repr(newline)):
+                headers, cookies = config.convert(
+                    "curl \\" + newline + " -H 'X-Name: pre'\"mid\"$'\\x21' "
+                    "-b \"wr_skey=ab\\" + newline + "cd;wr_vid=v\""
+                )
+                self.assertEqual(headers, {'X-Name': 'premid!'})
+                self.assertEqual(cookies, {'wr_skey': 'abcd', 'wr_vid': 'v'})
+        self.assertEqual(config._shell_tokens("curl 'a\\\nb'"), ['curl', 'a\\\nb'])
+        self.assertEqual(config._shell_tokens("curl a\\\nb"), ['curl', 'ab'])
+        self.assertEqual(config._shell_tokens("curl '' \"\" $''"), ['curl', '', '', ''])
+
+    def test_attached_options_and_switches(self):
+        config = self.load_config()
+        command = (
+            "curl --url=https://example.invalid -XPOST --request=POST -Aagent "
+            "--user-agent=agent -ehttps://example.invalid --referer=ignored "
+            "-d'-bBAD=body' --data='-HCookie: BAD=body' --data-binary=body "
+            "--data-raw=body --compressed --location --insecure -s "
+            "--header='X-Good: yes' -b'wr_skey=k;wr_vid=v'"
+        )
+        self.assertEqual(config.convert(command), ({'X-Good': 'yes'}, {'wr_skey': 'k', 'wr_vid': 'v'}))
+        self.assertEqual(config.convert("curl -- '-bBAD=body' '-HCookie: BAD=body'"), ({}, {}))
+
+    def test_unknown_and_missing_options_are_redacted(self):
+        config = self.load_config()
+        for command in (
+            "curl --unknown-private-secret '-bBAD=body'", "curl -zprivate-secret",
+            "curl --compressed=private-secret", "curl -sS", "private-secret -b x=1",
+            "curl -b 'x=private-secret' ; curl -b 'BAD=body'",
+        ):
+            with self.subTest(command=command), self.assertRaises(ValueError) as caught:
+                config.convert(command)
+            self.assertNotIn('private-secret', str(caught.exception))
+        for option in ('-H', '--header', '-b', '--cookie', '--data-raw', '-d',
+                       '--data', '--data-binary', '--url', '-X', '--request', '-A',
+                       '--user-agent', '-e', '--referer'):
+            with self.subTest(option=option), self.assertRaises(ValueError):
+                config.convert('curl ' + option)
+
+    def test_malformed_quotes_and_limits_are_redacted(self):
+        config = self.load_config()
+        for command in ("curl -b 'private-secret", 'curl -b "private-secret',
+                        "curl -b $'private-secret\\q'", "curl private-secret\\",
+                        "curl private-secret\x00", 'curl ' + 'private-secret' * 6000,
+                        'curl ' + 'x ' * 4096):
+            with self.subTest(command=command[:30]), self.assertRaises(ValueError) as caught:
+                config.convert(command)
+            self.assertNotIn('private-secret', str(caught.exception))
+        config = self.load_config(WXREAD_CURL_BASH="curl --unknown-private-secret")
+        with self.assertRaises(ValueError) as caught:
+            config.validate_config()
+        self.assertEqual(str(caught.exception), 'Unsupported curl configuration format')
+
+    def test_token_limits_accept_boundaries(self):
+        config = self.load_config()
+        self.assertEqual(config._shell_tokens('x' * 65536), ['x' * 65536])
+        self.assertEqual(len(config._shell_tokens('x ' * 4096)), 4096)
+
+    def test_quoted_control_characters_still_fail_validation(self):
+        for value in ('private\\nsecret', 'private\\rsecret'):
+            config = self.load_config(WXREAD_CURL_BASH="curl -b $'wr_skey=" + value + ";wr_vid=v'")
+            with self.subTest(value=value), self.assertRaises(ValueError) as caught:
+                config.validate_config()
+            self.assertNotIn('private-secret', str(caught.exception))
+
+    def test_expansion_text_is_literal_and_never_executed(self):
+        config = self.load_config()
+        with patch('os.system', side_effect=AssertionError('must not execute')):
+            headers, cookies = config.convert(
+                '''curl -H "X-Literal: $(private-command) `private-command` $HOME" -b 'x=$HOME' '''
+            )
+        self.assertEqual(headers['X-Literal'], '$(private-command) `private-command` $HOME')
+        self.assertEqual(cookies, {'x': '$HOME'})
+
     def test_curl_overrides_template_cookies(self):
         config = self.load_config(WXREAD_CURL_BASH="curl -b 'wr_skey=k;wr_vid=v'")
         self.assertEqual(config.cookies, {'wr_skey': 'k', 'wr_vid': 'v'})

@@ -65,9 +65,15 @@ class ReadingRunner:
 
     def post(self, url, payload):
         try:
-            return self.client.post(url, headers=self.headers, cookies=self.cookies,
-                                    data=json.dumps(payload, separators=(',', ':')),
-                                    timeout=REQUEST_TIMEOUT)
+            # Fixed authenticated endpoints must never forward cookies to a redirect target.
+            response = self.client.post(url, headers=self.headers, cookies=self.cookies,
+                                        data=json.dumps(payload, separators=(',', ':')),
+                                        timeout=REQUEST_TIMEOUT, allow_redirects=False)
+            # Reject informational/redirect responses before their bodies or cookies are used.
+            # Keep 4xx/5xx handling in callers so existing auth-recovery semantics remain intact.
+            if response.status_code < 200 or 300 <= response.status_code < 400:
+                raise requests.HTTPError("Unexpected HTTP status", response=response)
+            return response
         except ValueError:
             raise RuntimeError("请求参数格式无效，已隐藏敏感内容。") from None
 
