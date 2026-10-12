@@ -1,19 +1,16 @@
 name: wxread
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }} # 使用工作流名称作为并发组的key
   cancel-in-progress: true    # 取消任何正在进行的相同并发组的工作流
 
 on:
   schedule:
-# 凌晨任务：北京时间每天 02:07（UTC 前一天 18:07），避开 GitHub Actions 整点高峰
+    # 北京时间每天 02:07（UTC 前一天 18:07），避开整点高峰
     - cron: '7 18 * * *'
-    # 早间任务：北京时间每天 05:00（UTC 前一天 21:00）
-    #- cron: '0 21 * * *'
-    # 午间任务：北京时间每天 11:40（UTC 03:40）
-    #- cron: '40 3 * * *'
-    # 晚间任务：北京时间每天 22:00（UTC 14:00）
-    #- cron: '0 14 * * *'
   workflow_dispatch:  # 手动触发
 
 jobs:
@@ -59,7 +56,7 @@ jobs:
         https_proxy: ${{ secrets.https_proxy }}
 
       run: |
-        python main.py
+        python -u main.py
 
   keepalive-job:
     name: Keepalive Workflow

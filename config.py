@@ -1,11 +1,8 @@
-# config.py 自定义配置,包括阅读次数、推送token的填写
+# GitHub Actions Secrets/Variables 经环境变量注入配置。
 import os
 import re
 
-"""
-可修改区域
-默认使用本地值如果不存在从环境变量中获取值
-"""
+"""读取 Actions 注入的环境变量；不将登录凭据写入源码。"""
 
 
 def _read_num_from_env():
@@ -18,7 +15,7 @@ def _read_num_from_env():
         raise ValueError("READ_NUM must be a positive integer") from None
 
 
-# 阅读次数 默认40次/20分钟
+# 默认目标受理 40 次，不代表实际入账时长。
 CONFIG_ERROR = None
 try:
     READ_NUM = _read_num_from_env()
@@ -36,7 +33,7 @@ SERVERCHAN_SPT = "" or os.getenv("SERVERCHAN_SPT")
 # read接口的bash命令
 curl_str = os.getenv('WXREAD_CURL_BASH')
 
-# 本地部署可填写自己的 Cookie；不提供历史账号/设备示例值。
+# Cookie 由 WXREAD_CURL_BASH 解析，不内置账号凭据。
 cookies = {}
 
 headers = {

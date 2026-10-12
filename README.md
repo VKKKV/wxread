@@ -1,194 +1,60 @@
-# 更新第三版，提高读书稳定程度，最大限量保持cookie有效时间，欢迎fork！
+# wxread — GitHub Actions 专用
 
-## 项目介绍 📚
+基于 [findmover/wxread](https://github.com/findmover/wxread) 的微信读书接口上报脚本。本 fork 仅保留 GitHub Actions 定时／手动运行和离线回归测试，不再维护容器发布或常驻服务部署。
 
-这个脚本主要是为了在微信读书的阅读**挑战赛中刷时长**和**保持天数**。由于本人偶尔看书时未能及时签到，导致入场费打了水漂。网上找了一些，发现高赞的自动阅读需要挂阅读器模拟或者用ADB模拟，实现一点也不优雅。因此，我决定编写一个自动化脚本。通过对官网接口的抓包和JS逆向分析实现。
+接口受理不等于实际阅读时长入账，也不保证签到、排行榜或挑战赛计时。请遵守微信读书与 GitHub Actions 的使用规则。
 
-该脚本具备以下功能：
+## 配置与运行
 
-- **请求次数调节**：默认目标受理 40 次，每次受理后等待 30 秒；这不是实际入账时长，也不保证计入排行榜、挑战赛或签到。
-- **定时运行推送**：可部署在GitHub Action/服务器上，支持每天定时运行并推送结果到微信。
-- **Cookie 续期**：运行时尝试续期，刷新后的 Cookie 仅在本次运行的内存中使用。续期不等于永久登录，登录失效后仍需重新抓包。
-- **轻量化设计**：本脚本实现了轻量化的编写，部署服务器/GIthub action后到点运行，无需额外硬件。
+1. Fork 后打开 **Actions**，启用 `wxread` workflow。
+2. 在已登录的微信读书网页版正常阅读，使用浏览器 DevTools 的 Network 找到 `https://weread.qq.com/web/book/read` 请求，选择 **Copy as cURL (bash)**。这份内容包含登录凭据，请勿提交到仓库、贴到日志或公开分享。
+3. 在 **Settings → Secrets and variables → Actions** 配置下表。阅读 job 使用 `AutoRead` environment；如设置了环境级 Secret／Variable，它可能覆盖同名仓库配置，环境保护规则也可能要求审批。
+4. 在 **Actions → wxread → Run workflow** 手动验证，再在微信读书中核对实际新增时长。
 
-***
-## 操作步骤 🛠️
+| 名称 | 位置 | 用途 |
+| --- | --- | --- |
+| `WXREAD_CURL_BASH` | Secret，必填 | 完整的 cURL bash 抓包内容，须含非空 `wr_skey` 与 `wr_vid` |
+| `READ_NUM` | Variable，可选 | 目标受理次数，正整数；未设置时默认 40。每次受理后等待 30 秒，不代表实际新增时长 |
+| `PUSH_METHOD` | Secret，可选 | `pushplus`、`wxpusher`、`telegram` 或 `serverchan`；留空不推送 |
+| `PUSHPLUS_TOKEN` | Secret | 使用 PushPlus 时必填 |
+| `WXPUSHER_SPT` | Secret | 使用 WxPusher 时必填 |
+| `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` | Secret | 使用 Telegram 时必填 |
+| `SERVERCHAN_SPT` | Secret | 使用 ServerChan 时必填 |
+| `http_proxy`、`https_proxy` | Secret，可选 | HTTP／HTTPS 请求代理地址 |
 
-### 抓包准备
+唯一启用的 cron 在 [deploy.yml](.github/workflows/deploy.yml)：`7 18 * * *`，即 UTC 每天 18:07／北京时间次日 02:07。GitHub 定时任务可能延迟或被丢弃，实际触发须以 `event=schedule` 的运行记录为准。手动触发与定时触发使用相同入口和配置；同名工作流的新运行会取消旧运行。
 
-脚本逻辑还是比较简单的，`main.py`与`push.py`代码不需要改动。在微信阅读官网 [微信读书](https://weread.qq.com/) 搜索【三体】点开阅读点击下一页进行抓包，抓到`read`接口 `https://weread.qq.com/web/book/read`，如果返回格式正常（如：
+## 成功与时长的含义
 
-```json
-{
-  "succ": 1,
-  "synckey": 564589834
-}
-```
-右键复制为Bash格式。
+- 上报成功条件：HTTP 2xx、`succ == 1` 且 `synckey` 非 `None`，没有需要恢复的认证错误。
+- 进度／通知报告受理次数，以及已受理请求提交的 `rt` 秒数合计，并明确标注“实际入账未验证”。脚本耗时、请求次数乘 30 秒和 `rt` 合计都不能当作实际入账时长。
+- `rt` 沿用现有墙钟差生成方式，受网络等待、恢复退避和时钟跳变影响；最后一次受理后的等待不再上报。脚本不自动查询账号统计、排行榜或挑战赛。
+- cURL 解析器只读取显式 headers／cookies，不执行 shell、变量展开或文件读取，也不采用抓包正文。阅读正文与签名沿用现有实现，不承诺和真实阅读器完全一致。
+- 每次从 Secret 的 Cookie 开始，续期结果只在当前进程内存中保留；不改写 Secrets，不上传 Cookie artifact／cache。登录失效后需重新抓包。
+- 阅读和通知的认证请求不自动跟随重定向。推送服务受理不保证最终送达；Telegram 首次请求遵循环境代理，失败后有限重试直连。
 
-### 方法一： GitHub Action部署运行（GitHub运行）
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 达到目标受理次数，且通知被受理或未配置推送；不证明时长入账 |
+| `1` | 配置错误或阅读上报失败 |
+| `2` | 达到目标受理次数，但通知未被受理 |
 
+## 定时任务排查
 
-- Fork这个仓库后，先打开 fork 的 **Actions** 页面，启用 `wxread` workflow；公开仓库 fork 后，定时 workflow 默认不会自动启用。
-- 在仓库 **Settings** -> 左侧列表中的 **Secrets and variables** -> **Actions**，然后在右侧的 **Repository secrets** 中添加如下值：
-  - `WXREAD_CURL_BASH`：上面抓read接口后转换为curl_bash的数据。
-  - `PUSH_METHOD`：推送方法，4选1推送方式（pushplus、wxpusher、telegram、serverChan）。
-  - `PUSHPLUS_TOKEN` or `WXPUSHER_SPT` or `TELEGRAM_BOT_TOKEN`&`TELEGRAM_CHAT_ID` or `SERVERCHAN_SPT`: 选择推送后填写对应token。
-  
-- 在 **Variables** 部分，最下方添加变量：
-  - `READ_NUM`：设定每次阅读的目标次数。
+先检查 Actions 是否产生了运行记录，再检查真实阅读步骤，而不是把离线测试中的预期错误当成阅读失败。
 
+- **没有运行记录**：检查 workflow 是否启用、cron 是否在默认分支、`AutoRead` 保护规则及仓库页面的暂停提示。公开 fork 的定时工作流默认禁用；公开仓库长期无活动也可能自动禁用。
+- **GitHub 暂停 fork**：按页面提示恢复权限。已有 keepalive job 只尝试启用当前 workflow，不能保证解除仓库级暂停；整个工作流被阻止时也无法自救。
+- **任务绿色但时长没增加**：绿色只证明请求／通知通过脚本的受理条件。核对同一账号、同一统计页面及统计周期；不要仅凭上报日志判断实际入账。
+- **登录失败**：重新抓包更新 `WXREAD_CURL_BASH`；不要将 Cookie 明文写进源码。
 
-- 基本释义：
+## 开发验证
 
-| key                        | Value                               | 说明                                                         | 属性      |
-| ------------------------- | ---------------------------------- | ------------------------------------------------------------ | --------- |
-| `WXREAD_CURL_BASH`         | `read` 接口 `curl_bash`数据 | **必填**，必须提供有效指令                                   | secrets   |
-| `READ_NUM`                 | 目标受理请求次数              | **可选**，默认 40 次，每次受理后等待 30 秒；不代表入账时长                           | variables |
-| `PUSH_METHOD`              | `pushplus`/`wxpusher`/`telegram`/`serverchan`    | **可选**，推送方式，4选1，默认不推送                                       |    secrets     |
-| `PUSHPLUS_TOKEN`           | PushPlus 的 token                   | 当 `PUSH_METHOD=pushplus` 时必填，[获取地址](https://www.pushplus.plus/uc.html) | secrets   |
-| `WXPUSHER_SPT`             | WxPusher 的token                    | 当 `PUSH_METHOD=wxpusher` 时必填，[获取地址](https://wxpusher.zjiecode.com/docs/#/?id=获取spt) | secrets   |
-| `TELEGRAM_BOT_TOKEN`  <br>`TELEGRAM_CHAT_ID`   <br>`http_proxy`/`https_proxy`（可选）| 群组id以及机器人token                 | 当 `PUSH_METHOD=telegram` 时必填，[配置文档](https://www.nodeseek.com/post-22475-1) | secrets   |
-| `SERVERCHAN_SPT`          | serverchan 的 SendKey               | 当 `PUSH_METHOD=serverchan` 时必填，[获取地址](https://sct.ftqq.com/sendkey) | secrets   |
-
-**重要：除了READ_NUM配置在varables，其它的都配置在secrets里面的；需要推送`PUSH_METHOD`是必填的。**
-
-### 视频教程
-
-[![视频教程](https://github.com/user-attachments/assets/ec144869-3dbb-40fe-9bc5-f8bf1b5fce3c)](https://www.bilibili.com/video/BV1kJ6gY3En3/ "点击查看视频")
-
-
-### 方法二： 服务器运行（docker部署）
-
-**步骤1：** 创建 docker-compose.yml 文件
-
-```yaml
-services:
-  wxread:
-    image: ghcr.io/vkkkv/wxread:latest
-    container_name: wxread
-    restart: unless-stopped
-
-    environment:
-      TZ: "Asia/Shanghai"
-      
-      # 目标受理请求次数，默认 40；每次受理后等待 30 秒，不代表入账时长
-      READ_NUM: 40
-      
-      # 微信读书 curl bash 命令（必需）
-      # 使用 | 表示多行字符串，下一行开始粘贴完整的 curl 命令
-      WXREAD_CURL_BASH: |
-        curl 'https://weread.qq.com/web/book/read' \
-        -H 'accept: application/json, text/plain, */*' \
-        .....
-      
-      # 定时任务时间（Cron 表达式）
-      CRON_SCHEDULE: "0 1 * * *"
-      JOB_TIMEOUT_SECONDS: ""  # 空值自动计算单次任务预算
-      
-      # 可选配置：推送方式 (pushplus/wxpusher/telegram/serverchan)
-      PUSH_METHOD: ""
-      # PushPlus 推送配置
-      PUSHPLUS_TOKEN: ""
-      # Telegram 推送配置
-      TELEGRAM_BOT_TOKEN: ""
-      TELEGRAM_CHAT_ID: ""
-      # WxPusher 推送配置
-      WXPUSHER_SPT: ""
-      # ServerChan 推送配置
-      SERVERCHAN_SPT: ""
-```
-
-**Cron 定时任务配置：**
-- `0 1 * * *` - 每天凌晨1点（默认）
-- `0 */6 * * *` - 每6小时
-- `30 8 * * *` - 每天早上8:30
-- `0 1 * * 6` / `0 1 * * sun` - 每周日凌晨1点
-- `0 1 * * 0` / `0 1 * * mon` - 每周一凌晨1点
-
-使用 APScheduler `CronTrigger` 的五字段格式（分、时、日、月、星期），支持列表、范围与步长。星期从周一开始：`0=mon`、`6=sun`，不接受数字 `7`；`mon-sun` 表示整周。日和星期均受限时必须同时匹配（AND），不是 Unix Cron 的 OR 规则。
-没有未来执行日期的组合（例如 `0 1 31 2 *`）会在启动时以配置错误退出，不会保持一个永远不执行的调度器。
-`JOB_TIMEOUT_SECONDS` 必须为正整数；留空时按 `max(3600, READ_NUM * 90 + 900)` 自动计算，超时会终止本次子进程，避免后续定时任务长期被占用。
-
-**步骤2：** 启动容器
-
-```bash
-docker-compose up -d
-```
-
-**步骤3：** 查看日志和测试
-
-```bash
-# 查看日志
-docker-compose logs -f
-
-# 测试运行
-docker-compose exec wxread python /app/main.py
-```
-
-**Docker 说明：**
-- 镜像地址：`ghcr.io/vkkkv/wxread:latest`
-- 支持多架构：linux/amd64 和 linux/arm64
-- main/master 推送、v* 标签和手动运行会触发镜像流程；离线测试及真实镜像的无网络 smoke check 通过后才发布多架构镜像。
-- 每次构建发布独立的 `sha-完整提交SHA-run_id-run_attempt` 标签；可变标签（main/latest/版本别名）按 digest 串行提升，提升前核对远端 ref HEAD，完成后读回 digest。
-- 过时 ref 不提升可变标签；稳定 major/minor 别名还要求远端同版本系列没有更新的稳定 release tag，防止延迟的旧版本覆盖新版本。GitHub ref/tag 与 GHCR 写入不是原子事务，仍有检查至写入期间 ref/tag 变化的窗口；较新 tag 若构建失败，别名可能停留在此前成功版本。
-
-***
-## Attention 📢
-
-1. **请求次数调整**：`READ_NUM` 是目标受理次数，不是分钟数。每次受理后固定等待 30 秒，不保证签到或挑战赛完成。
-   
-2. **阅读时间未增加**：接口受理不等于实际入账。保留现有 `config.py` 中的正文和签名协议，不凭猜测修改字段；实际增加的时长应在微信读书中独立核对。
-
-3. **GitHub Action部署/本地部署**：Action 部署使用 Secrets/Variables；本地可使用环境变量或修改 `config.py` 的 headers/cookies，阅读次数由 `READ_NUM` 控制且必须为正整数。环境变量 `WXREAD_CURL_BASH` 会覆盖本地 headers/cookies；必须包含非空 `wr_skey` 和 `wr_vid`。
-
-4. **推送**：HTTP 状态与业务状态均通过后才视为服务受理，不保证最终送达。重试有上限且使用短退避，日志不输出 token 或服务原始响应。Telegram 首次请求遵循环境代理，失败后显式禁用环境代理尝试直连。阅读请求失败退出码为 1；目标受理次数完成但通知未受理为 2；请求及通知受理成功或完成请求且未配置推送为 0。这些返回码不证明阅读时长已入账。
-   阅读和通知的固定认证接口均不自动跟随重定向，避免向其他主机转发 Cookie、token 或通知内容；通知必须满足 HTTP 2xx。Telegram 首次请求支持 Requests 标准大小写代理变量及 `ALL_PROXY` / `NO_PROXY`。
-
-
-***
-## 请求受理与计时口径
-
-- `ReadingRunner.run()` 仍返回本次已受理请求次数（`int`）；沿用既有成功分支：HTTP 2xx、无需要恢复的认证错误、`succ == 1` 且 `synckey` 非 `None`。失败及恢复请求不计入受理次数。
-- `runner.accepted_count` 记录本次受理次数；`runner.accepted_seconds` 累计这些请求**提交的 `rt` 秒数**，仅累计非负整数（不含布尔值），每次 `run()` 开始时清零；中途失败保留已有记录。
-- `rt` 仍按既有墙钟差生成：首次以启动时刻减 30 秒为基准，后续以最近一次受理请求的发送时刻为基准。网络耗时、退避与时钟跳变可能影响它；末次受理后的等待也不等于提交时长。本次修改不改变生成、签名或恢复协议。
-- 进度、完成日志及通知分别报告受理次数和已受理请求提交的 `rt` 合计，并标明**实际入账未验证**。受理次数乘 30 秒、脚本耗时及 `rt` 合计都不能当作微信读书实际入账时长；脚本不查询排行榜、挑战赛或账户时长统计。
-
-## Cookie 续期与本地验证
-
-每次运行均从配置的 Cookie 开始，续期结果只保留在当前进程内存中，不读写 Cookie 状态文件。登录失效后仍需重新抓包并更新配置。
-
-GitHub Actions 每次仍从 `WXREAD_CURL_BASH` Secret 开始；本项目不自动改写 Secrets，也不上传 Cookie 为 artifact/cache。因此 Actions 不能承诺跨任务续期或永久免登录。代理地址可通过 `http_proxy` / `https_proxy` Secrets 配置，工作流会注入运行步骤。
-
-复制浏览器的 Copy as cURL (bash)；支持普通单/双引号、ANSI-C 引号和多行续行，但不会执行 shell、变量展开或文件读取。解析器只提取显式 header/cookie，按参数数目跳过已知 data/url/request/user-agent/referer 选项；未知选项、组合短开关和引号外 shell 操作符会安全拒绝。输入最多 65536 字符、4096 个 token，ANSI-C 使用严格 UTF-8 转义子集。`.env.example` 仅是配置模板，Python 不会自动加载 `.env`；Docker Compose 的 `.env` 插值也不等于向容器注入所有变量，应使用上面的 environment 配置。
+保留阅读脚本、配置解析、通知和 workflow 的离线回归。push／pull request 会运行 [tests.yml](.github/workflows/tests.yml)，不会执行真实阅读；`wxread` 的定时／手动 job 也先运行回归，再执行阅读。
 
 ```bash
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
-# 确认配置后才执行真实阅读
-python main.py
 ```
 
-Docker、本地和 Actions 使用同一份固定版本 `requirements.txt`。本 fork 的镜像地址为 `ghcr.io/vkkkv/wxread:latest`；其他 fork 需换成自己的 GHCR 命名空间。
-
-## 字段解释 🔍
-
-| 字段 | 示例值 | 解释 |
-| --- | --- | --- |
-| `appId` | `"wbxxxxxxxxxxxxxxxxxxxxxxxx"` | 应用的唯一标识符。 |
-| `b` | `"ce032b305a9bc1ce0b0dd2a"` | 书籍或章节的唯一标识符。 |
-| `c` | `"0723244023c072b030ba601"` | 内容的唯一标识符，可能是页面或具体段落。 |
-| `ci` | `60` | 章节或部分的索引。 |
-| `co` | `336` | 内容的具体位置或页码。 |
-| `sm` | `"[插图]威慑纪元61年，执剑人在一棵巨树"` | 当前阅读的内容描述或摘要。 |
-| `pr` | `65` | 页码或段落索引。 |
-| `rt` | `88` | 请求提交的墙钟差秒数，生成口径见上文；不等于服务端实际入账时长。 |
-| `ts` | `1727580815581` | 时间戳，表示请求发送的具体时间（毫秒级）。 |
-| `rn` | `114` | 随机数或请求编号，用于标识唯一的请求。 |
-| `sg` | `"bfdf7de2fe1673546ca079e2f02b79b937901ef789ed5ae16e7b43fb9e22e724"` | 安全签名，用于验证请求的合法性和完整性。 |
-| `ct` | `1727580815` | 时间戳，表示请求发送的具体时间（秒级）。 |
-| `ps` | `"xxxxxxxxxxxxxxxxxxxxxxxx"` | 用户标识符或会话标识符，用于追踪用户或会话。 |
-| `pc` | `"xxxxxxxxxxxxxxxxxxxxxxxx"` | 设备标识符或客户端标识符，用于标识用户的设备或客户端。 |
-| `s` | `"fadcb9de"` | 校验和或哈希值，用于验证请求数据的完整性。 |
-
-
+测试使用自编假数据和模拟接口，不证明服务端入账。Python 3.10 是阅读 job 的运行版本，离线 CI 另覆盖 Python 3.14。仓库不再提供镜像构建发布或本地定时部署入口。

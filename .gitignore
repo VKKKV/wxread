@@ -11,6 +11,11 @@ logs/
 .env.local
 .env.*.local
 
-# Cookie state contains credentials
+# Editor and virtualenv files
+.idea/
+.venv/
+venv/
+
+# Avoid accidentally tracking local credential artifacts
 state/
 .cookies.json
