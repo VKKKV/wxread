@@ -62,6 +62,8 @@ class ReadingRunner:
         self.sleep = time.sleep if sleep is None else sleep
         self.clock = time.time if clock is None else clock
         self.progress = progress or (lambda message: None)
+        self.accepted_count = 0
+        self.accepted_seconds = 0
 
     def post(self, url, payload):
         try:
@@ -98,10 +100,11 @@ class ReadingRunner:
         return False
 
     def run(self):
+        self.accepted_count = self.accepted_seconds = 0
         self.refresh_cookie(strict=False)
         last_time = int(self.clock()) - 30
         completed = recoveries = 0
-        logging.info("一共需要阅读 %d 次。", self.read_num)
+        logging.info("目标受理 %d 次；实际入账未验证。", self.read_num)
         while completed < self.read_num:
             payload = self.payload
             payload.pop('s', None)
@@ -114,7 +117,8 @@ class ReadingRunner:
             payload['rn'] = random.randint(0, 1000)
             payload['sg'] = hashlib.sha256(f"{payload['ts']}{payload['rn']}{KEY}".encode()).hexdigest()
             payload['s'] = cal_hash(encode_data(payload))
-            self.progress(f"阅读进度: 第 {completed + 1}/{self.read_num} 次，已完成 {completed * 0.5:.1f} 分钟")
+            submitted_rt = payload['rt']
+            self.progress(f"请求进度: 第 {completed + 1}/{self.read_num} 次，已受理 {completed} 次，已受理请求提交的 rt 合计 {self.accepted_seconds} 秒；实际入账未验证。")
             try:
                 response = self.post(READ_URL, payload)
                 result = response.json()
@@ -155,9 +159,14 @@ class ReadingRunner:
             recoveries = 0
             last_time = this_time
             completed += 1
+            self.accepted_count = completed
+            # 仅记录已受理请求提交的合法 rt；这不是服务端入账统计。
+            if type(submitted_rt) is int and submitted_rt >= 0:
+                self.accepted_seconds += submitted_rt
             self.sleep(30)
-            self.progress(f"阅读进度: 第 {completed}/{self.read_num} 次，已完成 {completed * 0.5:.1f} 分钟")
-        logging.info("阅读脚本已完成。")
+            self.progress(f"请求进度: 第 {completed}/{self.read_num} 次，已受理 {completed} 次，已受理请求提交的 rt 合计 {self.accepted_seconds} 秒；实际入账未验证。")
+        logging.info("阅读脚本已完成：已受理 %d 次，已受理请求提交的 rt 合计 %d 秒；实际入账未验证。",
+                     self.accepted_count, self.accepted_seconds)
         return completed
 
 
@@ -180,7 +189,7 @@ def main():
             logging.error("阅读失败，且失败通知未被推送服务受理。")
         return 1
     if method:
-        accepted = push(f"微信读书自动阅读完成。\n阅读时长：{completed * 0.5} 分钟。", method, is_success=True)
+        accepted = push(f"微信读书阅读请求已完成。\n已受理 {completed} 次，已受理请求提交的 rt 合计 {runner.accepted_seconds} 秒。\n实际入账未验证。", method, is_success=True)
         if not accepted:
             logging.error("阅读已完成，但完成通知未被推送服务受理。")
             return 2

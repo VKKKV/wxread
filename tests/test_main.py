@@ -1,5 +1,6 @@
 import copy
 import importlib
+import json
 import unittest
 from unittest.mock import Mock, call, patch
 from requests.adapters import HTTPAdapter
@@ -126,6 +127,89 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(runner.cookies['wr_skey'], 'NEWKEY12')
         runner.sleep.assert_called_once_with(30)
 
+    def test_accepted_rt_tracks_submitted_seconds_not_half_minutes(self):
+        runner, client = self.make_runner([response({'succ': 1, 'synckey': 123})] * 2)
+        runner.read_num = 2
+        runner.clock = Mock(side_effect=[1000, 1012, 1057])
+        runner.progress = Mock()
+        submitted = []
+        original_post = client.post.side_effect
+        def post(url, **kwargs):
+            if url == main.READ_URL:
+                submitted.append(json.loads(kwargs['data'])['rt'])
+            return original_post(url, **kwargs)
+        client.post.side_effect = post
+        with self.assertLogs(level='INFO') as logs:
+            self.assertIs(type(runner.run()), int)
+        self.assertEqual(submitted, [42, 45])
+        self.assertEqual(runner.accepted_count, 2)
+        self.assertEqual(runner.accepted_seconds, 87)
+        self.assertIn('已受理 2 次', logs.output[-1])
+        self.assertIn('rt 合计 87 秒；实际入账未验证', logs.output[-1])
+        self.assertEqual(runner.sleep.call_args_list, [call(30), call(30)])
+        messages = [item.args[0] for item in runner.progress.call_args_list]
+        self.assertEqual(len(messages), 4)
+        for message, count, seconds in zip(messages, (0, 1, 1, 2), (0, 42, 42, 87)):
+            self.assertIn(f'已受理 {count} 次', message)
+            self.assertIn(f'rt 合计 {seconds} 秒', message)
+            self.assertIn('实际入账未验证', message)
+            self.assertNotIn('分钟', message)
+
+    def test_recovery_requests_do_not_count_as_accepted_rt(self):
+        runner, _ = self.make_runner([
+            response({'errCode': -2012}), response({'succ': 1, 'synckey': 123}),
+            response({'succ': 1}), response({'succ': 1, 'synckey': 456}),
+        ])
+        runner.read_num = 2
+        runner.clock = Mock(side_effect=[1000, 1010, 1025, 1040, 1070])
+        self.assertEqual(runner.run(), 2)
+        self.assertEqual(runner.accepted_count, 2)
+        self.assertEqual(runner.accepted_seconds, 100)
+        self.assertEqual(runner.sleep.call_args_list, [call(5), call(30), call(5), call(30)])
+
+    def test_rejected_requests_leave_accepted_records_empty(self):
+        for result in (response({'succ': 0, 'synckey': 123}),
+                       response({'succ': 1, 'synckey': 123}, 500),
+                       response({'errCode': -999}), response([])):
+            with self.subTest(result=result):
+                runner, _ = self.make_runner([result])
+                with self.assertRaises(RuntimeError):
+                    runner.run()
+                self.assertEqual(runner.accepted_count, 0)
+                self.assertEqual(runner.accepted_seconds, 0)
+
+    def test_partial_failure_preserves_accepted_records(self):
+        runner, _ = self.make_runner([
+            response({'succ': 1, 'synckey': 123}), response({'succ': 0}),
+        ])
+        runner.read_num = 2
+        runner.clock = Mock(side_effect=[1000, 1012, 1057])
+        with self.assertRaises(RuntimeError):
+            runner.run()
+        self.assertEqual(runner.accepted_count, 1)
+        self.assertEqual(runner.accepted_seconds, 42)
+
+    def test_clock_rollback_does_not_subtract_accepted_seconds_or_change_rt(self):
+        for this_time, rt in ((970, 0), (960, -10)):
+            with self.subTest(rt=rt):
+                runner, client = self.make_runner([response({'succ': 1, 'synckey': 123})])
+                runner.clock = Mock(side_effect=[1000, this_time])
+                self.assertEqual(runner.run(), 1)
+                self.assertEqual(runner.accepted_count, 1)
+                self.assertEqual(runner.accepted_seconds, 0)
+                self.assertEqual(json.loads(client.post.call_args.kwargs['data'])['rt'], rt)
+
+    def test_repeated_run_resets_accepted_records(self):
+        runner, _ = self.make_runner([response({'succ': 1, 'synckey': 123})] * 2)
+        self.assertEqual(runner.accepted_count, 0)
+        self.assertEqual(runner.accepted_seconds, 0)
+        runner.clock = Mock(side_effect=[1000, 1012, 2000, 2001])
+        self.assertEqual(runner.run(), 1)
+        self.assertEqual(runner.accepted_seconds, 42)
+        self.assertEqual(runner.run(), 1)
+        self.assertEqual(runner.accepted_count, 1)
+        self.assertEqual(runner.accepted_seconds, 31)
+
     def test_succ_zero_is_not_success(self):
         runner, _ = self.make_runner([response({'succ': 0, 'synckey': 123})])
         with self.assertRaisesRegex(RuntimeError, '业务失败'):
@@ -155,12 +239,13 @@ class ReadingTests(unittest.TestCase):
             runner.run()
         self.assertNotIn('FAKE_SECRET', str(exc.exception))
 
-    def run_entry(self, completed=1, error=None, method='telegram', accepted=False):
+    def run_entry(self, completed=1, error=None, method='telegram', accepted=False, seconds=42):
         with patch('main.setup_logging'), patch('main.config.validate_config'), \
              patch('main.config.PUSH_METHOD', method), \
              patch('main.ReadingRunner') as cls, patch('main.push', return_value=accepted) as push:
             cls.return_value.run.return_value = completed
             cls.return_value.run.side_effect = error
+            cls.return_value.accepted_seconds = seconds
             result = main.main()
         return result, push
 
@@ -169,10 +254,31 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertTrue(push.call_args.kwargs['is_success'])
 
+    def test_completion_notification_reports_requests_not_credited_duration(self):
+        status, push = self.run_entry(completed=2, seconds=87, accepted=True)
+        self.assertEqual(status, 0)
+        push.assert_called_once_with(
+            '微信读书阅读请求已完成。\n已受理 2 次，已受理请求提交的 rt 合计 87 秒。\n实际入账未验证。',
+            'telegram', is_success=True,
+        )
+
     def test_reading_failure_notifies_once(self):
         status, push = self.run_entry(error=RuntimeError('fixed diagnostic'))
         self.assertEqual(status, 1)
         push.assert_called_once_with('fixed diagnostic', 'telegram', is_success=False)
+
+    def test_real_runner_completion_reaches_notification_offline(self):
+        runner, _ = self.make_runner([response({'succ': 1, 'synckey': 123})])
+        runner.clock = Mock(side_effect=[1000, 1012])
+        with patch('main.setup_logging'), patch('main.config.validate_config'), \
+             patch('main.config.PUSH_METHOD', 'telegram'), \
+             patch('main.ReadingRunner', return_value=runner), \
+             patch('main.push', return_value=True) as notify:
+            self.assertEqual(main.main(), 0)
+        notify.assert_called_once_with(
+            '微信读书阅读请求已完成。\n已受理 1 次，已受理请求提交的 rt 合计 42 秒。\n实际入账未验证。',
+            'telegram', is_success=True,
+        )
 
     def test_two_runs_start_from_config_and_use_renewal_in_memory(self):
         initial = {'wr_skey': 'initial', 'wr_vid': 'vid'}
